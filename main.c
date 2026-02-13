@@ -5,6 +5,8 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #define UI_IMPLEMENTATION
 #include "ui.h"
@@ -198,6 +200,51 @@ static int mlp_predict(MLP *m) {
     return pred;
 }
 
+// --- training thread ---
+
+typedef struct {
+    _Atomic int  step;
+    _Atomic int  epoch;
+    _Atomic int  correct;
+    _Atomic float loss;
+    _Atomic bool running;
+    _Atomic bool stop;
+
+    MLP *mlp;
+    idx_images *images;
+    idx_labels *labels;
+    float lr;
+} TrainCtx;
+
+static void *train_thread_fn(void *arg) {
+    TrainCtx *ctx = arg;
+    atomic_store(&ctx->running, true);
+
+    for (int epoch = 0; !atomic_load(&ctx->stop); epoch++) {
+        atomic_store(&ctx->epoch, epoch);
+        atomic_store(&ctx->step, 0);
+        atomic_store(&ctx->correct, 0);
+        for (u32 i = 0; i < ctx->images->count && !atomic_load(&ctx->stop); i++) {
+            u8 *px = ctx->images->pixels + (u64)i * 784;
+            u8 label = ctx->labels->labels[i];
+
+            tape_reset(&ctx->mlp->tape);
+            u32 loss_idx = mlp_forward(ctx->mlp, px, label);
+            tape_backward(&ctx->mlp->tape, loss_idx);
+            sgd_step(&ctx->mlp->tape, ctx->lr);
+
+            if (mlp_predict(ctx->mlp) == label)
+                atomic_fetch_add(&ctx->correct, 1);
+
+            atomic_store(&ctx->step, (int)i + 1);
+            atomic_store(&ctx->loss, tape_data(&ctx->mlp->tape, loss_idx));
+        }
+    }
+
+    atomic_store(&ctx->running, false);
+    return NULL;
+}
+
 // --- app state ---
 
 typedef enum {
@@ -241,34 +288,13 @@ int main(int argc, char *argv[]) {
            train_images.count, train_images.rows, train_images.cols,
            train_labels.count);
 
-    // --- MLP training test ---
-    {
-        printf("\nMLP training (784->128->10)...\n");
-        MLP mlp = mlp_create();
-        printf("  params: %u  (%zu bytes on tape)\n",
-               mlp.tape.perm_count, (size_t)mlp.tape.perm_count * sizeof(Node));
+    MLP mlp = mlp_create();
+    printf("MLP: %u params (%zu bytes)\n",
+           mlp.tape.perm_count, (size_t)mlp.tape.perm_count * sizeof(Node));
 
-        f32 lr = 0.01f;
-        u32 correct = 0;
-        for (u32 step = 0; step < 500; step++) {
-            u8 *px = train_images.pixels + (u64)step * 784;
-            u8 label = train_labels.labels[step];
-
-            tape_reset(&mlp.tape);
-            u32 loss_idx = mlp_forward(&mlp, px, label);
-            tape_backward(&mlp.tape, loss_idx);
-            sgd_step(&mlp.tape, lr);
-
-            if (mlp_predict(&mlp) == label) correct++;
-
-            if ((step + 1) % 100 == 0) {
-                printf("  step %3u: loss=%.4f  acc=%.1f%%  nodes=%u\n",
-                       step + 1, tape_data(&mlp.tape, loss_idx),
-                       100.0f * correct / (step + 1), mlp.tape.count);
-            }
-        }
-        tape_destroy(&mlp.tape);
-    }
+    TrainCtx train_ctx = {0};
+    pthread_t train_thread;
+    bool train_thread_active = false;
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -395,7 +421,13 @@ int main(int argc, char *argv[]) {
 
             if (ui_button(&ui, "Train", px, py, 252, 36)) {
                 screen = SCREEN_TRAINING;
-                // TODO: kick off training thread
+                train_ctx = (TrainCtx){0};
+                train_ctx.mlp = &mlp;
+                train_ctx.images = &train_images;
+                train_ctx.labels = &train_labels;
+                train_ctx.lr = 0.01f;
+                pthread_create(&train_thread, NULL, train_thread_fn, &train_ctx);
+                train_thread_active = true;
             }
             py += 52;
 
@@ -404,16 +436,28 @@ int main(int argc, char *argv[]) {
             ui_text(&ui, "q/esc: quit", px, py, UI_GRAY(100));
 
         } else if (screen == SCREEN_TRAINING) {
-            ui_text(&ui, "Training...", px, py, UI_RGB(100, 200, 100));
-            py += 28;
+            int s = atomic_load(&train_ctx.step);
+            int ep = atomic_load(&train_ctx.epoch);
+            int cor = atomic_load(&train_ctx.correct);
+            float loss = atomic_load(&train_ctx.loss);
+            float acc = s > 0 ? 100.0f * cor / s : 0;
 
-            // TODO: show live loss/accuracy from train thread
-            ui_text(&ui, "loss: ---", px, py, UI_GRAY(160));
+            snprintf(buf, sizeof(buf), "epoch %d  step %d", ep, s);
+            ui_text(&ui, buf, px, py, UI_RGB(100, 200, 100));
             py += 22;
-            ui_text(&ui, "accuracy: ---", px, py, UI_GRAY(160));
+
+            snprintf(buf, sizeof(buf), "loss: %.4f", loss);
+            ui_text(&ui, buf, px, py, UI_GRAY(160));
+            py += 22;
+
+            snprintf(buf, sizeof(buf), "accuracy: %.1f%%", acc);
+            ui_text(&ui, buf, px, py, UI_GRAY(160));
             py += 40;
 
-            if (ui_button(&ui, "Back", px, py, 252, 32)) {
+            if (ui_button(&ui, "Stop", px, py, 252, 32)) {
+                atomic_store(&train_ctx.stop, true);
+                pthread_join(train_thread, NULL);
+                train_thread_active = false;
                 screen = SCREEN_VIEW;
             }
         }
@@ -421,6 +465,12 @@ int main(int argc, char *argv[]) {
         SDL_RenderPresent(renderer);
         SDL_Delay(16);
     }
+
+    if (train_thread_active) {
+        atomic_store(&train_ctx.stop, true);
+        pthread_join(train_thread, NULL);
+    }
+    tape_destroy(&mlp.tape);
 
     ui_destroy(&ui);
     SDL_DestroyTexture(grid_tex);
