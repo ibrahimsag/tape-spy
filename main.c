@@ -6,6 +6,9 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
+#define UI_IMPLEMENTATION
+#include "ui.h"
+
 // --- IDX file loading ---
 
 typedef struct {
@@ -57,9 +60,39 @@ static idx_labels idx_load_labels(mem_arena *arena, const char *path) {
     return lbl;
 }
 
-// --- rendering ---
+// --- blit MNIST grid into pixel buffer ---
 
-#define DISPLAY_SCALE 2
+static void blit_grid(u32 *pixel_buf, int tex_w, int tex_h,
+                      idx_images *images, u32 offset,
+                      int grid_cols, int grid_rows) {
+    int img_w = images->cols;
+    int img_h = images->rows;
+    memset(pixel_buf, 0, sizeof(u32) * tex_w * tex_h);
+    for (int gy = 0; gy < grid_rows; gy++) {
+        for (int gx = 0; gx < grid_cols; gx++) {
+            u32 idx = offset + gy * grid_cols + gx;
+            if (idx >= images->count) return;
+            u8 *src = images->pixels + (u64)idx * img_w * img_h;
+            for (int y = 0; y < img_h; y++) {
+                for (int x = 0; x < img_w; x++) {
+                    u8 v = src[y * img_w + x];
+                    int px = gx * img_w + x;
+                    int py = gy * img_h + y;
+                    pixel_buf[py * tex_w + px] = 0xFF000000 | (v << 16) | (v << 8) | v;
+                }
+            }
+        }
+    }
+}
+
+// --- app state ---
+
+typedef enum {
+    SCREEN_VIEW,
+    SCREEN_TRAINING,
+    SCREEN_RESULTS,
+} Screen;
+
 #define GRID_COLS 20
 #define GRID_ROWS 10
 #define GRID_COUNT (GRID_COLS * GRID_ROWS)
@@ -72,12 +105,11 @@ int main(int argc, char *argv[]) {
         Tape tape = tape_create(MiB(1));
         u32 x = tape_param(&tape, 3.0f);
         u32 y = tape_param(&tape, 4.0f);
-        // z = x*y + x  =>  dz/dx = y + 1 = 5,  dz/dy = x = 3
         u32 xy = val_mul(&tape, x, y);
         u32 z  = val_add(&tape, xy, x);
         tape_backward(&tape, z);
         printf("autograd test: z = x*y + x, x=3, y=4\n");
-        printf("  z    = %.1f (expect 15.0)\n", tape_data(&tape, z));
+        printf("  z     = %.1f (expect 15.0)\n", tape_data(&tape, z));
         printf("  dz/dx = %.1f (expect 5.0)\n", tape_grad(&tape, x));
         printf("  dz/dy = %.1f (expect 3.0)\n", tape_grad(&tape, y));
         tape_destroy(&tape);
@@ -103,10 +135,13 @@ int main(int argc, char *argv[]) {
 
     int img_w = train_images.cols;
     int img_h = train_images.rows;
-    int win_w = img_w * GRID_COLS * DISPLAY_SCALE;
-    int win_h = img_h * GRID_ROWS * DISPLAY_SCALE;
+    int panel_w = 280;
+    int grid_pixel_w = img_w * GRID_COLS;
+    int grid_pixel_h = img_h * GRID_ROWS;
+    int win_w = grid_pixel_w + panel_w;
+    int win_h = grid_pixel_h;
 
-    SDL_Window *window = SDL_CreateWindow("MNIST", win_w, win_h, 0);
+    SDL_Window *window = SDL_CreateWindow("MNIST", win_w, win_h, SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
@@ -118,38 +153,38 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // texture for the full grid
-    int tex_w = img_w * GRID_COLS;
-    int tex_h = img_h * GRID_ROWS;
-    SDL_Texture *texture = SDL_CreateTexture(
+    SDL_SetRenderVSync(renderer, 1);
+    SDL_SetRenderLogicalPresentation(renderer, win_w, win_h,
+                                     SDL_LOGICAL_PRESENTATION_LETTERBOX);
+
+    // UI
+    UICtx ui;
+    float dpi_scale = SDL_GetWindowDisplayScale(window);
+    if (dpi_scale < 1.0f) dpi_scale = 1.0f;
+    if (!ui_init(&ui, renderer, "SourceCodePro-Regular.ttf", 16.0f, dpi_scale)) {
+        fprintf(stderr, "ui_init failed\n");
+        return 1;
+    }
+
+    // MNIST grid texture
+    SDL_Texture *grid_tex = SDL_CreateTexture(
         renderer, SDL_PIXELFORMAT_ABGR8888,
-        SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h
+        SDL_TEXTUREACCESS_STREAMING, grid_pixel_w, grid_pixel_h
     );
 
-    u32 *pixel_buf = PUSH_ARRAY(arena, u32, tex_w * tex_h);
+    u32 *pixel_buf = PUSH_ARRAY(arena, u32, grid_pixel_w * grid_pixel_h);
     u32 offset = 0;
+    bool grid_dirty = true;
 
-    // blit grid of images into pixel buffer
-    for (int gy = 0; gy < GRID_ROWS; gy++) {
-        for (int gx = 0; gx < GRID_COLS; gx++) {
-            u32 idx = offset + gy * GRID_COLS + gx;
-            if (idx >= train_images.count) break;
-            u8 *src = train_images.pixels + (u64)idx * img_w * img_h;
-            for (int y = 0; y < img_h; y++) {
-                for (int x = 0; x < img_w; x++) {
-                    u8 v = src[y * img_w + x];
-                    int px = gx * img_w + x;
-                    int py = gy * img_h + y;
-                    pixel_buf[py * tex_w + px] = 0xFF000000 | (v << 16) | (v << 8) | v;
-                }
-            }
-        }
-    }
+    Screen screen = SCREEN_VIEW;
 
     bool running = true;
     while (running) {
+        ui_begin(&ui);
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
+            ui_event(&ui, &event);
             if (event.type == SDL_EVENT_QUIT) {
                 running = false;
             }
@@ -157,42 +192,96 @@ int main(int argc, char *argv[]) {
                 if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_Q) {
                     running = false;
                 }
-                if (event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE) {
-                    if (offset + GRID_COUNT < train_images.count) offset += GRID_COUNT;
-                }
-                if (event.key.key == SDLK_LEFT) {
-                    if (offset >= GRID_COUNT) offset -= GRID_COUNT;
-                    else offset = 0;
-                }
-
-                // re-blit
-                memset(pixel_buf, 0, sizeof(u32) * tex_w * tex_h);
-                for (int gy = 0; gy < GRID_ROWS; gy++) {
-                    for (int gx = 0; gx < GRID_COLS; gx++) {
-                        u32 idx = offset + gy * GRID_COLS + gx;
-                        if (idx >= train_images.count) break;
-                        u8 *src = train_images.pixels + (u64)idx * img_w * img_h;
-                        for (int y = 0; y < img_h; y++) {
-                            for (int x = 0; x < img_w; x++) {
-                                u8 v = src[y * img_w + x];
-                                int px = gx * img_w + x;
-                                int py = gy * img_h + y;
-                                pixel_buf[py * tex_w + px] = 0xFF000000 | (v << 16) | (v << 8) | v;
-                            }
+                if (screen == SCREEN_VIEW) {
+                    if (event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE) {
+                        if (offset + GRID_COUNT < train_images.count) {
+                            offset += GRID_COUNT;
+                            grid_dirty = true;
                         }
+                    }
+                    if (event.key.key == SDLK_LEFT) {
+                        if (offset >= GRID_COUNT) offset -= GRID_COUNT;
+                        else offset = 0;
+                        grid_dirty = true;
                     }
                 }
             }
         }
 
-        SDL_UpdateTexture(texture, NULL, pixel_buf, tex_w * sizeof(u32));
+        // update grid texture if needed
+        if (grid_dirty) {
+            blit_grid(pixel_buf, grid_pixel_w, grid_pixel_h,
+                      &train_images, offset, GRID_COLS, GRID_ROWS);
+            SDL_UpdateTexture(grid_tex, NULL, pixel_buf, grid_pixel_w * sizeof(u32));
+            grid_dirty = false;
+        }
+
+        // --- render ---
+        SDL_SetRenderDrawColor(renderer, 25, 25, 25, 255);
         SDL_RenderClear(renderer);
-        SDL_RenderTexture(renderer, texture, NULL, NULL);
+
+        // MNIST grid on the left
+        SDL_FRect grid_dst = {0, 0, grid_pixel_w, grid_pixel_h};
+        SDL_RenderTexture(renderer, grid_tex, NULL, &grid_dst);
+
+        // right panel
+        float px = grid_pixel_w + 16;
+        float py = 16;
+
+        ui_text(&ui, "MNIST Explorer", px, py, UI_WHITE);
+        py += 28;
+
+        char buf[64];
+        snprintf(buf, sizeof(buf), "showing %u-%u / %u",
+                 offset, offset + GRID_COUNT - 1, train_images.count);
+        ui_text(&ui, buf, px, py, UI_GRAY(160));
+        py += 36;
+
+        if (screen == SCREEN_VIEW) {
+            if (ui_button(&ui, "< prev", px, py, 120, 32)) {
+                if (offset >= GRID_COUNT) offset -= GRID_COUNT;
+                else offset = 0;
+                grid_dirty = true;
+            }
+            if (ui_button(&ui, "next >", px + 132, py, 120, 32)) {
+                if (offset + GRID_COUNT < train_images.count) {
+                    offset += GRID_COUNT;
+                    grid_dirty = true;
+                }
+            }
+            py += 48;
+
+            if (ui_button(&ui, "Train", px, py, 252, 36)) {
+                screen = SCREEN_TRAINING;
+                // TODO: kick off training thread
+            }
+            py += 52;
+
+            ui_text(&ui, "arrows/space: browse", px, py, UI_GRAY(100));
+            py += 20;
+            ui_text(&ui, "q/esc: quit", px, py, UI_GRAY(100));
+
+        } else if (screen == SCREEN_TRAINING) {
+            ui_text(&ui, "Training...", px, py, UI_RGB(100, 200, 100));
+            py += 28;
+
+            // TODO: show live loss/accuracy from train thread
+            ui_text(&ui, "loss: ---", px, py, UI_GRAY(160));
+            py += 22;
+            ui_text(&ui, "accuracy: ---", px, py, UI_GRAY(160));
+            py += 40;
+
+            if (ui_button(&ui, "Back", px, py, 252, 32)) {
+                screen = SCREEN_VIEW;
+            }
+        }
+
         SDL_RenderPresent(renderer);
         SDL_Delay(16);
     }
 
-    SDL_DestroyTexture(texture);
+    ui_destroy(&ui);
+    SDL_DestroyTexture(grid_tex);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
