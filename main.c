@@ -85,6 +85,119 @@ static void blit_grid(u32 *pixel_buf, int tex_w, int tex_h,
     }
 }
 
+// --- PRNG (LCG) ---
+
+static u64 _rng_state = 0x12345678DEADBEEFULL;
+
+static f32 rng_f32(void) {
+    _rng_state = _rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (f32)((_rng_state >> 33) & 0x7FFFFF) / (f32)(1 << 23);
+}
+
+static f32 rng_normal(void) {
+    f32 s = 0;
+    for (int i = 0; i < 12; i++) s += rng_f32();
+    return s - 6.0f;
+}
+
+// --- MLP (784 -> 128 -> 10) ---
+
+#define MLP_IN  784
+#define MLP_HID 128
+#define MLP_OUT 10
+
+typedef struct {
+    u32 start;    // first weight param index in tape
+    u32 in_dim;
+    u32 out_dim;
+    // weights[i][j] at: start + i * in_dim + j
+    // biases[i] at:     start + out_dim * in_dim + i
+} Layer;
+
+typedef struct {
+    Tape tape;
+    Layer l1, l2;
+    u32 logits[MLP_OUT]; // filled by mlp_forward
+} MLP;
+
+static MLP mlp_create(void) {
+    MLP m;
+    m.tape = tape_create(MiB(64));
+
+    // Layer 1: 784 -> 128 (He init)
+    m.l1 = (Layer){ .start = m.tape.count, .in_dim = MLP_IN, .out_dim = MLP_HID };
+    f32 s1 = sqrtf(2.0f / MLP_IN);
+    for (u32 i = 0; i < MLP_HID * MLP_IN; i++) tape_param(&m.tape, rng_normal() * s1);
+    for (u32 i = 0; i < MLP_HID; i++) tape_param(&m.tape, 0.0f);
+
+    // Layer 2: 128 -> 10
+    m.l2 = (Layer){ .start = m.tape.count, .in_dim = MLP_HID, .out_dim = MLP_OUT };
+    f32 s2 = sqrtf(2.0f / MLP_HID);
+    for (u32 i = 0; i < MLP_OUT * MLP_HID; i++) tape_param(&m.tape, rng_normal() * s2);
+    for (u32 i = 0; i < MLP_OUT; i++) tape_param(&m.tape, 0.0f);
+
+    return m;
+}
+
+static void linear_fwd(Tape *t, Layer *l, u32 *in, u32 *out) {
+    for (u32 i = 0; i < l->out_dim; i++) {
+        u32 w = l->start + i * l->in_dim;
+        u32 acc = val_mul(t, w, in[0]);
+        for (u32 j = 1; j < l->in_dim; j++)
+            acc = val_add(t, acc, val_mul(t, w + j, in[j]));
+        out[i] = val_add(t, acc, l->start + l->out_dim * l->in_dim + i);
+    }
+}
+
+// Forward pass: returns loss node index, fills m->logits
+static u32 mlp_forward(MLP *m, u8 *pixels, u8 label) {
+    Tape *t = &m->tape;
+
+    // Input leaves (normalize 0-255 -> 0-1)
+    u32 inp[MLP_IN];
+    for (u32 i = 0; i < MLP_IN; i++)
+        inp[i] = tape_leaf(t, (f32)pixels[i] / 255.0f);
+
+    // Layer 1 + ReLU
+    u32 hid[MLP_HID];
+    linear_fwd(t, &m->l1, inp, hid);
+    for (u32 i = 0; i < MLP_HID; i++) hid[i] = val_relu(t, hid[i]);
+
+    // Layer 2 (logits)
+    linear_fwd(t, &m->l2, hid, m->logits);
+
+    // Cross-entropy via log-softmax (numerically stable)
+    f32 max_v = tape_data(t, m->logits[0]);
+    for (u32 i = 1; i < MLP_OUT; i++) {
+        f32 v = tape_data(t, m->logits[i]);
+        if (v > max_v) max_v = v;
+    }
+    u32 mx = tape_leaf(t, max_v);
+
+    // sum of exp(logit - max)
+    u32 se = val_exp(t, val_sub(t, m->logits[0], mx));
+    for (u32 i = 1; i < MLP_OUT; i++)
+        se = val_add(t, se, val_exp(t, val_sub(t, m->logits[i], mx)));
+
+    // loss = log(sum_exp) - (logit[label] - max) = -log_softmax(label)
+    return val_sub(t, val_log(t, se), val_sub(t, m->logits[label], mx));
+}
+
+static void sgd_step(Tape *t, f32 lr) {
+    for (u32 i = 0; i < t->perm_count; i++)
+        t->base[i].data -= lr * t->base[i].grad;
+}
+
+static int mlp_predict(MLP *m) {
+    int pred = 0;
+    f32 best = tape_data(&m->tape, m->logits[0]);
+    for (u32 i = 1; i < MLP_OUT; i++) {
+        f32 v = tape_data(&m->tape, m->logits[i]);
+        if (v > best) { best = v; pred = (int)i; }
+    }
+    return pred;
+}
+
 // --- app state ---
 
 typedef enum {
@@ -127,6 +240,35 @@ int main(int argc, char *argv[]) {
     printf("loaded %u images (%ux%u), %u labels\n",
            train_images.count, train_images.rows, train_images.cols,
            train_labels.count);
+
+    // --- MLP training test ---
+    {
+        printf("\nMLP training (784->128->10)...\n");
+        MLP mlp = mlp_create();
+        printf("  params: %u  (%zu bytes on tape)\n",
+               mlp.tape.perm_count, (size_t)mlp.tape.perm_count * sizeof(Node));
+
+        f32 lr = 0.01f;
+        u32 correct = 0;
+        for (u32 step = 0; step < 500; step++) {
+            u8 *px = train_images.pixels + (u64)step * 784;
+            u8 label = train_labels.labels[step];
+
+            tape_reset(&mlp.tape);
+            u32 loss_idx = mlp_forward(&mlp, px, label);
+            tape_backward(&mlp.tape, loss_idx);
+            sgd_step(&mlp.tape, lr);
+
+            if (mlp_predict(&mlp) == label) correct++;
+
+            if ((step + 1) % 100 == 0) {
+                printf("  step %3u: loss=%.4f  acc=%.1f%%  nodes=%u\n",
+                       step + 1, tape_data(&mlp.tape, loss_idx),
+                       100.0f * correct / (step + 1), mlp.tape.count);
+            }
+        }
+        tape_destroy(&mlp.tape);
+    }
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
