@@ -207,12 +207,15 @@ typedef struct {
     _Atomic int  epoch;
     _Atomic int  correct;
     _Atomic float loss;
+    _Atomic float test_acc;
     _Atomic bool running;
     _Atomic bool stop;
 
     MLP *mlp;
     idx_images *images;
     idx_labels *labels;
+    idx_images *test_images;
+    idx_labels *test_labels;
     float lr;
 } TrainCtx;
 
@@ -239,6 +242,18 @@ static void *train_thread_fn(void *arg) {
             atomic_store(&ctx->step, (int)i + 1);
             atomic_store(&ctx->loss, tape_data(&ctx->mlp->tape, loss_idx));
         }
+
+        // evaluate on test set
+        int test_correct = 0;
+        for (u32 i = 0; i < ctx->test_images->count && !atomic_load(&ctx->stop); i++) {
+            u8 *px = ctx->test_images->pixels + (u64)i * 784;
+            u8 label = ctx->test_labels->labels[i];
+            tape_reset(&ctx->mlp->tape);
+            mlp_forward(ctx->mlp, px, label);
+            if (mlp_predict(ctx->mlp) == label) test_correct++;
+        }
+        if (!atomic_load(&ctx->stop))
+            atomic_store(&ctx->test_acc, 100.0f * test_correct / (int)ctx->test_images->count);
     }
 
     atomic_store(&ctx->running, false);
@@ -279,14 +294,17 @@ int main(int argc, char *argv[]) {
 
     idx_images train_images = idx_load_images(arena, "data/train-images-idx3-ubyte");
     idx_labels train_labels = idx_load_labels(arena, "data/train-labels-idx1-ubyte");
+    idx_images test_images  = idx_load_images(arena, "data/t10k-images-idx3-ubyte");
+    idx_labels test_labels  = idx_load_labels(arena, "data/t10k-labels-idx1-ubyte");
 
-    if (!train_images.pixels || !train_labels.labels) {
+    if (!train_images.pixels || !train_labels.labels ||
+        !test_images.pixels  || !test_labels.labels) {
         fprintf(stderr, "failed to load MNIST data\n");
         return 1;
     }
-    printf("loaded %u images (%ux%u), %u labels\n",
-           train_images.count, train_images.rows, train_images.cols,
-           train_labels.count);
+    printf("loaded %u train, %u test (%ux%u)\n",
+           train_images.count, test_images.count,
+           train_images.rows, train_images.cols);
 
     MLP mlp = mlp_create();
     printf("MLP: %u params (%zu bytes)\n",
@@ -425,6 +443,8 @@ int main(int argc, char *argv[]) {
                 train_ctx.mlp = &mlp;
                 train_ctx.images = &train_images;
                 train_ctx.labels = &train_labels;
+                train_ctx.test_images = &test_images;
+                train_ctx.test_labels = &test_labels;
                 train_ctx.lr = 0.01f;
                 pthread_create(&train_thread, NULL, train_thread_fn, &train_ctx);
                 train_thread_active = true;
@@ -450,8 +470,13 @@ int main(int argc, char *argv[]) {
             ui_text(&ui, buf, px, py, UI_GRAY(160));
             py += 22;
 
-            snprintf(buf, sizeof(buf), "accuracy: %.1f%%", acc);
+            snprintf(buf, sizeof(buf), "train acc: %.1f%%", acc);
             ui_text(&ui, buf, px, py, UI_GRAY(160));
+            py += 22;
+
+            float ta = atomic_load(&train_ctx.test_acc);
+            snprintf(buf, sizeof(buf), "test acc:  %.1f%%", ta);
+            ui_text(&ui, buf, px, py, ta > 0 ? UI_WHITE : UI_GRAY(100));
             py += 40;
 
             if (ui_button(&ui, "Stop", px, py, 252, 32)) {
