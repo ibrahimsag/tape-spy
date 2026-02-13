@@ -202,12 +202,16 @@ static int mlp_predict(MLP *m) {
 
 // --- training thread ---
 
+#define ACC_HIST 32
+
 typedef struct {
     _Atomic int  step;
     _Atomic int  epoch;
     _Atomic int  correct;
     _Atomic float loss;
     _Atomic float test_acc;
+    _Atomic int  hist_count;
+    float hist[ACC_HIST];       // ring buffer, written by train thread
     _Atomic bool running;
     _Atomic bool stop;
 
@@ -252,8 +256,13 @@ static void *train_thread_fn(void *arg) {
             mlp_forward(ctx->mlp, px, label);
             if (mlp_predict(ctx->mlp) == label) test_correct++;
         }
-        if (!atomic_load(&ctx->stop))
-            atomic_store(&ctx->test_acc, 100.0f * test_correct / (int)ctx->test_images->count);
+        if (!atomic_load(&ctx->stop)) {
+            float ta = 100.0f * test_correct / (int)ctx->test_images->count;
+            atomic_store(&ctx->test_acc, ta);
+            int hc = atomic_load(&ctx->hist_count);
+            ctx->hist[hc % ACC_HIST] = ta;
+            atomic_store(&ctx->hist_count, hc + 1);
+        }
     }
 
     atomic_store(&ctx->running, false);
@@ -325,7 +334,7 @@ int main(int argc, char *argv[]) {
     int grid_pixel_w = img_w * GRID_COLS;
     int grid_pixel_h = img_h * GRID_ROWS;
     int win_w = grid_pixel_w + panel_w;
-    int win_h = grid_pixel_h;
+    int win_h = grid_pixel_h > 400 ? grid_pixel_h : 400;
 
     SDL_Window *window = SDL_CreateWindow("MNIST", win_w, win_h, SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
@@ -477,7 +486,58 @@ int main(int argc, char *argv[]) {
             float ta = atomic_load(&train_ctx.test_acc);
             snprintf(buf, sizeof(buf), "test acc:  %.1f%%", ta);
             ui_text(&ui, buf, px, py, ta > 0 ? UI_WHITE : UI_GRAY(100));
-            py += 40;
+            py += 28;
+
+            // test accuracy graph
+            {
+                float gx = px, gy = py, gw = 240, gh = 80;
+                ui_rect(&ui, gx, gy, gw, gh, UI_GRAY(35));
+                ui_rect_outline(&ui, gx, gy, gw, gh, UI_GRAY(60));
+
+                int hc = atomic_load(&train_ctx.hist_count);
+                int show = hc < ACC_HIST ? hc : ACC_HIST;
+                int start = hc < ACC_HIST ? 0 : hc - ACC_HIST;
+
+                if (show > 0) {
+                    // find y range
+                    float ymin = 100, ymax = 0;
+                    for (int i = 0; i < show; i++) {
+                        float v = train_ctx.hist[(start + i) % ACC_HIST];
+                        if (v < ymin) ymin = v;
+                        if (v > ymax) ymax = v;
+                    }
+                    float pad = (ymax - ymin) * 0.15f;
+                    if (pad < 2) pad = 2;
+                    ymin -= pad; ymax += pad;
+                    if (ymin < 0) ymin = 0;
+                    if (ymax > 100) ymax = 100;
+                    float yrange = ymax - ymin;
+                    if (yrange < 1) yrange = 1;
+
+                    // y-axis labels
+                    snprintf(buf, sizeof(buf), "%.0f%%", ymax);
+                    ui_text(&ui, buf, gx + 2, gy, UI_GRAY(100));
+                    snprintf(buf, sizeof(buf), "%.0f%%", ymin);
+                    ui_text(&ui, buf, gx + 2, gy + gh - 16, UI_GRAY(100));
+
+                    // line graph
+                    for (int i = 0; i < show; i++) {
+                        float v = train_ctx.hist[(start + i) % ACC_HIST];
+                        float x0 = gx + (show > 1 ? (float)i / (show - 1) * gw : gw * 0.5f);
+                        float y0 = gy + gh - (v - ymin) / yrange * gh;
+                        // dot
+                        ui_rect(&ui, x0 - 1, y0 - 1, 3, 3, UI_RGB(80, 180, 255));
+                        // line to previous
+                        if (i > 0) {
+                            float vp = train_ctx.hist[(start + i - 1) % ACC_HIST];
+                            float xp = gx + (float)(i - 1) / (show - 1) * gw;
+                            float yp = gy + gh - (vp - ymin) / yrange * gh;
+                            ui_line(&ui, xp, yp, x0, y0, UI_RGB(80, 180, 255));
+                        }
+                    }
+                }
+                py += gh + 8;
+            }
 
             if (ui_button(&ui, "Stop", px, py, 252, 32)) {
                 atomic_store(&train_ctx.stop, true);
