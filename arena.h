@@ -111,7 +111,8 @@ b32   plat_mem_release(void* ptr, u64 size);
  * Implementation
  * ================================================================ */
 
-#ifdef ARENA_IMPLEMENTATION
+#if defined(ARENA_IMPLEMENTATION) && !defined(ARENA_IMPLEMENTATION_DONE)
+#define ARENA_IMPLEMENTATION_DONE
 
 mem_arena* arena_create(u64 reserve_size, u64 commit_size) {
     u32 pagesize = plat_get_pagesize();

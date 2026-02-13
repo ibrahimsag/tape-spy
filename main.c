@@ -1,5 +1,7 @@
 #define ARENA_IMPLEMENTATION
 #include "arena.h"
+#define AUTOGRAD_IMPLEMENTATION
+#include "autograd.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -64,6 +66,22 @@ static idx_labels idx_load_labels(mem_arena *arena, const char *path) {
 
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
+
+    // --- autograd sanity test ---
+    {
+        Tape tape = tape_create(MiB(1));
+        u32 x = tape_param(&tape, 3.0f);
+        u32 y = tape_param(&tape, 4.0f);
+        // z = x*y + x  =>  dz/dx = y + 1 = 5,  dz/dy = x = 3
+        u32 xy = val_mul(&tape, x, y);
+        u32 z  = val_add(&tape, xy, x);
+        tape_backward(&tape, z);
+        printf("autograd test: z = x*y + x, x=3, y=4\n");
+        printf("  z    = %.1f (expect 15.0)\n", tape_data(&tape, z));
+        printf("  dz/dx = %.1f (expect 5.0)\n", tape_grad(&tape, x));
+        printf("  dz/dy = %.1f (expect 3.0)\n", tape_grad(&tape, y));
+        tape_destroy(&tape);
+    }
 
     mem_arena *arena = arena_create(MiB(256), MiB(1));
 
@@ -140,8 +158,7 @@ int main(int argc, char *argv[]) {
                     running = false;
                 }
                 if (event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE) {
-                    offset += GRID_COUNT;
-                    if (offset >= train_images.count) offset = 0;
+                    if (offset + GRID_COUNT < train_images.count) offset += GRID_COUNT;
                 }
                 if (event.key.key == SDLK_LEFT) {
                     if (offset >= GRID_COUNT) offset -= GRID_COUNT;
