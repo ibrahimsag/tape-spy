@@ -1,0 +1,16 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-c",
+      "-O2",
+      "-I/opt/homebrew/include",
+      "-o",
+      "mnist_view",
+      "main.c"
+    ],
+    "directory": "/Users/ibrahim/m/gpt",
+    "file": "/Users/ibrahim/m/gpt/main.c",
+    "output": "/Users/ibrahim/m/gpt/mnist_view"
+  }
+]
