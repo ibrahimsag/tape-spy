@@ -267,6 +267,28 @@ static int mlp_predict(MLP *m) {
     return pred;
 }
 
+// --- tape visualization ---
+
+static void dump_tape_spy(Tape *t, const char *path, int S) {
+    u8 *img = calloc(S * S, 1);
+    for (u32 i = 0; i < t->count; i++) {
+        Node *n = &t->base[i];
+        int x = (int)((u64)i * (S - 1) / t->count);
+        for (u32 c = 0; c < n->arity; c++) {
+            int y = (int)((u64)n->children[c] * (S - 1) / t->count);
+            int idx = y * S + x;
+            if (img[idx] < 240) img[idx] += 15;
+            else img[idx] = 255;
+        }
+    }
+    FILE *f = fopen(path, "wb");
+    fprintf(f, "P5\n%d %d\n255\n", S, S);
+    fwrite(img, 1, S * S, f);
+    fclose(f);
+    free(img);
+    printf("spy plot: %s (%ux%u, %u nodes)\n", path, S, S, t->count);
+}
+
 // --- training thread ---
 
 #define ACC_HIST 32
@@ -281,6 +303,7 @@ typedef struct {
     float hist[ACC_HIST];       // ring buffer, written by train thread
     _Atomic bool running;
     _Atomic bool stop;
+    _Atomic bool dump_requested;
 
     MLP *mlp;
     idx_images *images;
@@ -310,6 +333,11 @@ static void *train_thread_fn(void *arg) {
             tape_reset(tape);
             u32 loss_idx = mlp_forward(ctx->mlp, px, label);
             tape_backward(tape, loss_idx);
+
+            if (atomic_load(&ctx->dump_requested)) {
+                dump_tape_spy(tape, "tape_spy.pgm", 4096);
+                atomic_store(&ctx->dump_requested, false);
+            }
 
             if (mlp_predict(ctx->mlp) == label)
                 atomic_fetch_add(&ctx->correct, 1);
@@ -468,6 +496,9 @@ int main(int argc, char *argv[]) {
             if (event.type == SDL_EVENT_KEY_DOWN) {
                 if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_Q) {
                     running = false;
+                }
+                if (event.key.key == SDLK_D && screen == SCREEN_TRAINING) {
+                    atomic_store(&train_ctx.dump_requested, true);
                 }
                 if (screen == SCREEN_VIEW) {
                     if (event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE) {
