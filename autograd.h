@@ -109,14 +109,14 @@ void tape_destroy(Tape *t) {
 }
 
 void tape_reset(Tape *t) {
-    // zero gradients on parameter nodes
-    for (u32 i = 0; i < t->perm_count; i++) {
-        t->base[i].grad = 0.0f;
-    }
-    // pop computation nodes
     u64 perm_end = ARENA_BASE_POS + (u64)t->perm_count * sizeof(Node);
     arena_pop_to(t->arena, perm_end);
     t->count = t->perm_count;
+}
+
+void tape_zero_grad(Tape *t) {
+    for (u32 i = 0; i < t->perm_count; i++)
+        t->base[i].grad = 0.0f;
 }
 
 /* ---- leaf creation ---- */

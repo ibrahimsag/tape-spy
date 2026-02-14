@@ -299,20 +299,31 @@ static void *train_thread_fn(void *arg) {
         atomic_store(&ctx->epoch, epoch);
         atomic_store(&ctx->step, 0);
         atomic_store(&ctx->correct, 0);
+        Tape *tape = &ctx->mlp->tape;
+        int B = 32;
+        tape_zero_grad(tape);
+
         for (u32 i = 0; i < ctx->images->count && !atomic_load(&ctx->stop); i++) {
             u8 *px = ctx->images->pixels + (u64)i * 784;
             u8 label = ctx->labels->labels[i];
 
-            tape_reset(&ctx->mlp->tape);
+            tape_reset(tape);
             u32 loss_idx = mlp_forward(ctx->mlp, px, label);
-            tape_backward(&ctx->mlp->tape, loss_idx);
-            adam_step(&ctx->mlp->tape, ctx->lr, &adam);
+            tape_backward(tape, loss_idx);
 
             if (mlp_predict(ctx->mlp) == label)
                 atomic_fetch_add(&ctx->correct, 1);
 
+            if ((i + 1) % B == 0) {
+                f32 scale = 1.0f / B;
+                for (u32 j = 0; j < tape->perm_count; j++)
+                    tape->base[j].grad *= scale;
+                adam_step(tape, ctx->lr, &adam);
+                tape_zero_grad(tape);
+            }
+
             atomic_store(&ctx->step, (int)i + 1);
-            atomic_store(&ctx->loss, tape_data(&ctx->mlp->tape, loss_idx));
+            atomic_store(&ctx->loss, tape_data(tape, loss_idx));
 
             // evaluate on test set every 10K steps
             if ((i + 1) % 10000 == 0) {
@@ -331,6 +342,7 @@ static void *train_thread_fn(void *arg) {
                     ctx->hist[hc % ACC_HIST] = ta;
                     atomic_store(&ctx->hist_count, hc + 1);
                 }
+                tape_zero_grad(tape);
             }
         }
     }
