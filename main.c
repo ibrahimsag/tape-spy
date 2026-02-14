@@ -489,33 +489,41 @@ static void spy_build_pyramid(SpyCtx *spy) {
 // Render a level into an RGBA pixel buffer (1024x1024)
 #define SPY_CANVAS 1024
 
-static void spy_render_level(SpyCtx *spy, u32 level_idx, u32 *rgba) {
-    if (level_idx >= spy->num_levels) return;
+typedef struct { u32 w, h; } SpyTexSize;
+
+static SpyTexSize spy_render_level(SpyCtx *spy, u32 level_idx, u32 *rgba) {
+    SpyTexSize sz = {0, 0};
+    if (level_idx >= spy->num_levels) return sz;
     SpyLevel *lv = &spy->levels[level_idx];
 
-    // clear to black
-    memset(rgba, 0, SPY_CANVAS * SPY_CANVAS * sizeof(u32));
+    u32 tw = lv->col_count < SPY_CANVAS ? lv->col_count : SPY_CANVAS;
+    u32 th = lv->row_count < SPY_CANVAS ? lv->row_count : SPY_CANVAS;
+    sz.w = tw;
+    sz.h = th;
+
+    // clear
+    memset(rgba, 0, tw * th * sizeof(u32));
 
     // accumulate into u16 count buffer
-    u16 *buf = calloc(SPY_CANVAS * SPY_CANVAS, sizeof(u16));
+    u16 *buf = calloc(tw * th, sizeof(u16));
     u16 max_count = 0;
 
     for (u32 r = 0; r < lv->row_count; r++) {
-        int py = (int)((u64)r * (SPY_CANVAS - 1) / lv->row_count);
+        int py = th > 1 ? (int)((u64)r * (th - 1) / (lv->row_count - 1)) : 0;
         u32 start = lv->row_ptr[r];
         u32 end   = lv->row_ptr[r + 1];
         for (u32 j = start; j < end; j++) {
-            int px = (int)((u64)lv->col_idx[j] * (SPY_CANVAS - 1) / lv->col_count);
-            int idx = py * SPY_CANVAS + px;
+            int px = tw > 1 ? (int)((u64)lv->col_idx[j] * (tw - 1) / (lv->col_count - 1)) : 0;
+            int idx = py * tw + px;
             buf[idx] += (u16)(lv->counts[j] > 65535 - buf[idx] ? 65535 - buf[idx] : lv->counts[j]);
             if (buf[idx] > max_count) max_count = buf[idx];
         }
     }
 
     // OKLCH color pass
-    for (int i = 0; i < SPY_CANVAS * SPY_CANVAS; i++) {
+    for (u32 i = 0; i < tw * th; i++) {
         if (buf[i] == 0) {
-            rgba[i] = 0xFF191919; // dark gray background
+            rgba[i] = 0xFF191919;
         } else {
             float frac = max_count > 1
                 ? (float)(buf[i] - 1) / (float)(max_count - 1)
@@ -523,19 +531,23 @@ static void spy_render_level(SpyCtx *spy, u32 level_idx, u32 *rgba) {
             float hue = 260.0f - frac * 230.0f;
             u8 r, g, b;
             _oklch_to_rgb(0.75f, 0.15f, hue, &r, &g, &b);
-            rgba[i] = 0xFF000000 | ((u32)b << 16) | ((u32)g << 8) | r; // ABGR
+            rgba[i] = 0xFF000000 | ((u32)b << 16) | ((u32)g << 8) | r;
         }
     }
 
     // diagonal reference
-    for (int i = 0; i < SPY_CANVAS; i++) {
-        int idx = i * SPY_CANVAS + i;
+    u32 diag = tw < th ? tw : th;
+    for (u32 i = 0; i < diag; i++) {
+        int px = tw > 1 ? (int)((u64)i * (tw - 1) / (diag - 1)) : 0;
+        int py = th > 1 ? (int)((u64)i * (th - 1) / (diag - 1)) : 0;
+        int idx = py * tw + px;
         if (buf[idx] == 0) {
             rgba[idx] = 0xFF282828;
         }
     }
 
     free(buf);
+    return sz;
 }
 
 static void dump_tape_spy(Tape *t, const char *path, int S) {
@@ -782,11 +794,9 @@ int main(int argc, char *argv[]) {
     u32 offset = 0;
     bool grid_dirty = true;
 
-    // spy texture (1024x1024)
-    SDL_Texture *spy_tex = SDL_CreateTexture(
-        renderer, SDL_PIXELFORMAT_ABGR8888,
-        SDL_TEXTUREACCESS_STREAMING, SPY_CANVAS, SPY_CANVAS
-    );
+    // spy texture (variable size, recreated per level)
+    SDL_Texture *spy_tex = NULL;
+    u32 spy_tex_w = 0, spy_tex_h = 0;
     u32 *spy_pixels = PUSH_ARRAY(arena, u32, SPY_CANVAS * SPY_CANVAS);
     Screen prev_screen = SCREEN_VIEW;
     Screen screen = SCREEN_VIEW;
@@ -983,14 +993,23 @@ int main(int argc, char *argv[]) {
         } else if (screen == SCREEN_SPY) {
             // update spy texture if needed
             if (spy_dirty && spy.num_levels > 0) {
-                spy_render_level(&spy, spy_level_idx, spy_pixels);
-                SDL_UpdateTexture(spy_tex, NULL, spy_pixels, SPY_CANVAS * sizeof(u32));
+                SpyTexSize sz = spy_render_level(&spy, spy_level_idx, spy_pixels);
+                // recreate texture if size changed
+                if (sz.w != spy_tex_w || sz.h != spy_tex_h) {
+                    if (spy_tex) SDL_DestroyTexture(spy_tex);
+                    spy_tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
+                                                SDL_TEXTUREACCESS_STREAMING, sz.w, sz.h);
+                    SDL_SetTextureScaleMode(spy_tex, SDL_SCALEMODE_NEAREST);
+                    spy_tex_w = sz.w;
+                    spy_tex_h = sz.h;
+                }
+                SDL_UpdateTexture(spy_tex, NULL, spy_pixels, sz.w * sizeof(u32));
                 spy_dirty = false;
             }
 
-            // draw canvas
+            // draw canvas — stretch texture to 1024x1024
             SDL_FRect spy_dst = {0, 0, 1024, 1024};
-            SDL_RenderTexture(renderer, spy_tex, NULL, &spy_dst);
+            if (spy_tex) SDL_RenderTexture(renderer, spy_tex, NULL, &spy_dst);
 
             // sidebar
             SpyLevel *lv = &spy.levels[spy_level_idx];
@@ -1023,7 +1042,7 @@ int main(int argc, char *argv[]) {
 
     arena_destroy(spy.arena);
     ui_destroy(&ui);
-    SDL_DestroyTexture(spy_tex);
+    if (spy_tex) SDL_DestroyTexture(spy_tex);
     SDL_DestroyTexture(grid_tex);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
