@@ -559,8 +559,10 @@ static SpyRenderResult spy_render_level(SpyCtx *spy, u32 level_idx,
     // clear
     memset(rgba, 0, tw * th * sizeof(u32));
 
-    // accumulate into u16 count buffer
-    u16 *buf = calloc(tw * th, sizeof(u16));
+    // accumulate into u16 count buffer (scratch arena, released at end)
+    mem_arena_temp scratch = arena_scratch_get(NULL, 0);
+    u16 *buf = PUSH_ARRAY(scratch.arena, u16, tw * th);
+    memset(buf, 0, tw * th * sizeof(u16));
     u32 level_max = lv->max_count;
 
     for (u32 r = r0; r < r1; r++) {
@@ -606,7 +608,7 @@ static SpyRenderResult spy_render_level(SpyCtx *spy, u32 level_idx,
         }
     }
 
-    free(buf);
+    arena_scratch_release(scratch);
     return res;
 }
 
@@ -908,7 +910,8 @@ int main(int argc, char *argv[]) {
                         // zoom centered on mouse position
                         float frac_x = mx / SPY_CANVAS;
                         float frac_y = my / SPY_CANVAS;
-                        float zoom = event.wheel.y > 0 ? 0.8f : 1.25f;
+                        float zoom_speed = 0.1f;
+                        float zoom = 1.0f / (1.0f + event.wheel.y * zoom_speed);
                         float new_span = cam_span * zoom;
                         if (new_span < 1.0f / (1 << 20)) new_span = 1.0f / (1 << 20);
                         if (new_span > 1.0f) new_span = 1.0f;
