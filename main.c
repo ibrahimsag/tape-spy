@@ -120,7 +120,7 @@ typedef struct {
 
 typedef struct {
     Tape tape;
-    ConvLayer c1, c2;
+    ConvLayer c1, c2, c3;
     Layer fc;
     u32 logits[MLP_OUT];
 } MLP;
@@ -129,22 +129,28 @@ static MLP mlp_create(void) {
     MLP m;
     m.tape = tape_create(MiB(64));
 
-    // Conv1: 1->16 filters, 5x5, stride 2  (28x28 -> 12x12)
+    // Conv1: 1->16, 5x5, stride 2  (28x28 -> 12x12)
     m.c1 = (ConvLayer){ .start = m.tape.count, .in_c = 1, .out_c = 16, .kh = 5, .kw = 5, .stride = 2 };
     f32 s1 = sqrtf(2.0f / (5 * 5));
     for (u32 i = 0; i < 16 * 5 * 5; i++) tape_param(&m.tape, rng_normal() * s1);
     for (u32 i = 0; i < 16; i++) tape_param(&m.tape, 0.0f);
 
-    // Conv2: 16->32 filters, 3x3, stride 2  (12x12 -> 5x5)
+    // Conv2: 16->32, 3x3, stride 2  (12x12 -> 5x5)
     m.c2 = (ConvLayer){ .start = m.tape.count, .in_c = 16, .out_c = 32, .kh = 3, .kw = 3, .stride = 2 };
     f32 s2 = sqrtf(2.0f / (3 * 3 * 16));
     for (u32 i = 0; i < 32 * 3 * 3 * 16; i++) tape_param(&m.tape, rng_normal() * s2);
     for (u32 i = 0; i < 32; i++) tape_param(&m.tape, 0.0f);
 
-    // FC: 5*5*32=800 -> 10
-    m.fc = (Layer){ .start = m.tape.count, .in_dim = 800, .out_dim = MLP_OUT };
-    f32 s3 = sqrtf(2.0f / 800);
-    for (u32 i = 0; i < MLP_OUT * 800; i++) tape_param(&m.tape, rng_normal() * s3);
+    // Conv3: 32->64, 3x3, stride 1  (5x5 -> 3x3)
+    m.c3 = (ConvLayer){ .start = m.tape.count, .in_c = 32, .out_c = 64, .kh = 3, .kw = 3, .stride = 1 };
+    f32 s3 = sqrtf(2.0f / (3 * 3 * 32));
+    for (u32 i = 0; i < 64 * 3 * 3 * 32; i++) tape_param(&m.tape, rng_normal() * s3);
+    for (u32 i = 0; i < 64; i++) tape_param(&m.tape, 0.0f);
+
+    // FC: 3*3*64=576 -> 10
+    m.fc = (Layer){ .start = m.tape.count, .in_dim = 576, .out_dim = MLP_OUT };
+    f32 s4 = sqrtf(2.0f / 576);
+    for (u32 i = 0; i < MLP_OUT * 576; i++) tape_param(&m.tape, rng_normal() * s4);
     for (u32 i = 0; i < MLP_OUT; i++) tape_param(&m.tape, 0.0f);
 
     return m;
@@ -209,8 +215,13 @@ static u32 mlp_forward(MLP *m, u8 *pixels, u8 label) {
     conv_fwd(t, &m->c2, c1, 12, 12, c2);
     for (u32 i = 0; i < 5 * 5 * 32; i++) c2[i] = val_relu(t, c2[i]);
 
-    // FC: 800 -> 10 (c2 is already flat)
-    linear_fwd(t, &m->fc, c2, m->logits);
+    // Conv3 + ReLU: 5x5x32 -> 3x3x64
+    u32 c3[3 * 3 * 64];
+    conv_fwd(t, &m->c3, c2, 5, 5, c3);
+    for (u32 i = 0; i < 3 * 3 * 64; i++) c3[i] = val_relu(t, c3[i]);
+
+    // FC: 576 -> 10
+    linear_fwd(t, &m->fc, c3, m->logits);
 
     // Cross-entropy via log-softmax (numerically stable)
     f32 max_v = tape_data(t, m->logits[0]);
