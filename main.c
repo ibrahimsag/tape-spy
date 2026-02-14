@@ -302,9 +302,9 @@ static void dump_tape_spy(Tape *t, const char *path, int S) {
     u16 max_count = 0;
     for (u32 i = 0; i < t->count; i++) {
         Node *n = &t->base[i];
-        int x = (int)((u64)i * (S - 1) / t->count);
+        int y = (int)((u64)i * (S - 1) / t->count);          // row = from (node)
         for (u32 c = 0; c < n->arity; c++) {
-            int y = (int)((u64)n->children[c] * (S - 1) / t->count);
+            int x = (int)((u64)n->children[c] * (S - 1) / t->count); // col = to (child)
             int idx = y * S + x;
             counts[idx]++;
             if (counts[idx] > max_count) max_count = counts[idx];
