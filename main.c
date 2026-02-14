@@ -102,47 +102,49 @@ static f32 rng_normal(void) {
     return s - 6.0f;
 }
 
-// --- MLP (784 -> 128 -> 10) ---
+// --- CNN (conv 5x5 -> conv 3x3 -> FC) ---
 
-#define MLP_IN   784
-#define MLP_HID1 128
-#define MLP_HID2 64
-#define MLP_OUT  10
+#define MLP_OUT 10
 
 typedef struct {
-    u32 start;    // first weight param index in tape
-    u32 in_dim;
-    u32 out_dim;
-    // weights[i][j] at: start + i * in_dim + j
-    // biases[i] at:     start + out_dim * in_dim + i
+    u32 start;
+    u32 in_dim, out_dim;
 } Layer;
 
 typedef struct {
+    u32 start;
+    u32 in_c, out_c;
+    u32 kh, kw;
+    u32 stride;
+} ConvLayer;
+
+typedef struct {
     Tape tape;
-    Layer l1, l2, l3;
-    u32 logits[MLP_OUT]; // filled by mlp_forward
+    ConvLayer c1, c2;
+    Layer fc;
+    u32 logits[MLP_OUT];
 } MLP;
 
 static MLP mlp_create(void) {
     MLP m;
     m.tape = tape_create(MiB(64));
 
-    // Layer 1: 784 -> 128 (He init)
-    m.l1 = (Layer){ .start = m.tape.count, .in_dim = MLP_IN, .out_dim = MLP_HID1 };
-    f32 s1 = sqrtf(2.0f / MLP_IN);
-    for (u32 i = 0; i < MLP_HID1 * MLP_IN; i++) tape_param(&m.tape, rng_normal() * s1);
-    for (u32 i = 0; i < MLP_HID1; i++) tape_param(&m.tape, 0.0f);
+    // Conv1: 1->16 filters, 5x5, stride 2  (28x28 -> 12x12)
+    m.c1 = (ConvLayer){ .start = m.tape.count, .in_c = 1, .out_c = 16, .kh = 5, .kw = 5, .stride = 2 };
+    f32 s1 = sqrtf(2.0f / (5 * 5));
+    for (u32 i = 0; i < 16 * 5 * 5; i++) tape_param(&m.tape, rng_normal() * s1);
+    for (u32 i = 0; i < 16; i++) tape_param(&m.tape, 0.0f);
 
-    // Layer 2: 128 -> 64
-    m.l2 = (Layer){ .start = m.tape.count, .in_dim = MLP_HID1, .out_dim = MLP_HID2 };
-    f32 s2 = sqrtf(2.0f / MLP_HID1);
-    for (u32 i = 0; i < MLP_HID2 * MLP_HID1; i++) tape_param(&m.tape, rng_normal() * s2);
-    for (u32 i = 0; i < MLP_HID2; i++) tape_param(&m.tape, 0.0f);
+    // Conv2: 16->32 filters, 3x3, stride 2  (12x12 -> 5x5)
+    m.c2 = (ConvLayer){ .start = m.tape.count, .in_c = 16, .out_c = 32, .kh = 3, .kw = 3, .stride = 2 };
+    f32 s2 = sqrtf(2.0f / (3 * 3 * 16));
+    for (u32 i = 0; i < 32 * 3 * 3 * 16; i++) tape_param(&m.tape, rng_normal() * s2);
+    for (u32 i = 0; i < 32; i++) tape_param(&m.tape, 0.0f);
 
-    // Layer 3: 64 -> 10
-    m.l3 = (Layer){ .start = m.tape.count, .in_dim = MLP_HID2, .out_dim = MLP_OUT };
-    f32 s3 = sqrtf(2.0f / MLP_HID2);
-    for (u32 i = 0; i < MLP_OUT * MLP_HID2; i++) tape_param(&m.tape, rng_normal() * s3);
+    // FC: 5*5*32=800 -> 10
+    m.fc = (Layer){ .start = m.tape.count, .in_dim = 800, .out_dim = MLP_OUT };
+    f32 s3 = sqrtf(2.0f / 800);
+    for (u32 i = 0; i < MLP_OUT * 800; i++) tape_param(&m.tape, rng_normal() * s3);
     for (u32 i = 0; i < MLP_OUT; i++) tape_param(&m.tape, 0.0f);
 
     return m;
@@ -158,27 +160,57 @@ static void linear_fwd(Tape *t, Layer *l, u32 *in, u32 *out) {
     }
 }
 
+// Conv2D forward: in[h][w][c] -> out[h][w][f]
+static void conv_fwd(Tape *t, ConvLayer *l, u32 *in, u32 in_h, u32 in_w, u32 *out) {
+    u32 out_h = (in_h - l->kh) / l->stride + 1;
+    u32 out_w = (in_w - l->kw) / l->stride + 1;
+    u32 ksz = l->kh * l->kw * l->in_c;
+
+    for (u32 f = 0; f < l->out_c; f++) {
+        u32 w_base = l->start + f * ksz;
+        u32 bias_idx = l->start + l->out_c * ksz + f;
+        for (u32 oy = 0; oy < out_h; oy++) {
+            u32 iy0 = oy * l->stride;
+            for (u32 ox = 0; ox < out_w; ox++) {
+                u32 ix0 = ox * l->stride;
+                u32 acc = 0, w = 0;
+                for (u32 ky = 0; ky < l->kh; ky++) {
+                    for (u32 kx = 0; kx < l->kw; kx++) {
+                        for (u32 c = 0; c < l->in_c; c++) {
+                            u32 in_idx = (iy0+ky) * in_w * l->in_c + (ix0+kx) * l->in_c + c;
+                            u32 prod = val_mul(t, w_base + w, in[in_idx]);
+                            acc = (w == 0) ? prod : val_add(t, acc, prod);
+                            w++;
+                        }
+                    }
+                }
+                out[oy * out_w * l->out_c + ox * l->out_c + f] = val_add(t, acc, bias_idx);
+            }
+        }
+    }
+}
+
 // Forward pass: returns loss node index, fills m->logits
 static u32 mlp_forward(MLP *m, u8 *pixels, u8 label) {
     Tape *t = &m->tape;
 
-    // Input leaves (normalize 0-255 -> 0-1)
-    u32 inp[MLP_IN];
-    for (u32 i = 0; i < MLP_IN; i++)
+    // Input leaves: 28x28x1
+    u32 inp[28 * 28];
+    for (u32 i = 0; i < 28 * 28; i++)
         inp[i] = tape_leaf(t, (f32)pixels[i] / 255.0f);
 
-    // Layer 1 + ReLU
-    u32 h1[MLP_HID1];
-    linear_fwd(t, &m->l1, inp, h1);
-    for (u32 i = 0; i < MLP_HID1; i++) h1[i] = val_relu(t, h1[i]);
+    // Conv1 + ReLU: 28x28x1 -> 12x12x16
+    u32 c1[12 * 12 * 16];
+    conv_fwd(t, &m->c1, inp, 28, 28, c1);
+    for (u32 i = 0; i < 12 * 12 * 16; i++) c1[i] = val_relu(t, c1[i]);
 
-    // Layer 2 + ReLU
-    u32 h2[MLP_HID2];
-    linear_fwd(t, &m->l2, h1, h2);
-    for (u32 i = 0; i < MLP_HID2; i++) h2[i] = val_relu(t, h2[i]);
+    // Conv2 + ReLU: 12x12x16 -> 5x5x32
+    u32 c2[5 * 5 * 32];
+    conv_fwd(t, &m->c2, c1, 12, 12, c2);
+    for (u32 i = 0; i < 5 * 5 * 32; i++) c2[i] = val_relu(t, c2[i]);
 
-    // Layer 3 (logits)
-    linear_fwd(t, &m->l3, h2, m->logits);
+    // FC: 800 -> 10 (c2 is already flat)
+    linear_fwd(t, &m->fc, c2, m->logits);
 
     // Cross-entropy via log-softmax (numerically stable)
     f32 max_v = tape_data(t, m->logits[0]);
@@ -188,12 +220,10 @@ static u32 mlp_forward(MLP *m, u8 *pixels, u8 label) {
     }
     u32 mx = tape_leaf(t, max_v);
 
-    // sum of exp(logit - max)
     u32 se = val_exp(t, val_sub(t, m->logits[0], mx));
     for (u32 i = 1; i < MLP_OUT; i++)
         se = val_add(t, se, val_exp(t, val_sub(t, m->logits[i], mx)));
 
-    // loss = log(sum_exp) - (logit[label] - max) = -log_softmax(label)
     return val_sub(t, val_log(t, se), val_sub(t, m->logits[label], mx));
 }
 
