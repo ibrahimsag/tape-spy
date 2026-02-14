@@ -309,6 +309,7 @@ typedef struct {
     u32 *row_ptr;   // [row_count + 1]
     u32 *col_idx;   // [nnz]
     u32 *counts;    // [nnz]
+    u32 max_count;  // max of counts[]
 } SpyLevel;
 
 typedef struct {
@@ -356,6 +357,7 @@ static void spy_build_level0(SpyCtx *spy, Tape *t) {
             }
         }
     }
+    lv->max_count = 1;  // all entries are count=1 at level 0
 }
 
 // Build level 0 from random data for testing
@@ -397,6 +399,7 @@ static void spy_build_random(SpyCtx *spy, u32 N) {
             lv->counts[pos++] = 1;
         }
     }
+    lv->max_count = 1;
 }
 
 // Build coarser level k+1 from level k
@@ -469,6 +472,12 @@ static void spy_build_coarser(SpyCtx *spy, u32 k) {
     }
     dst->row_ptr[dst->row_count] = out_pos;
     dst->nnz = out_pos;
+
+    // find max count
+    u32 mc_max = 0;
+    for (u32 i = 0; i < out_pos; i++)
+        if (out_counts[i] > mc_max) mc_max = out_counts[i];
+    dst->max_count = mc_max;
 
     // copy exact-sized results into persistent arena
     dst->col_idx = PUSH_ARRAY(spy->arena, u32, out_pos);
@@ -552,7 +561,7 @@ static SpyRenderResult spy_render_level(SpyCtx *spy, u32 level_idx,
 
     // accumulate into u16 count buffer
     u16 *buf = calloc(tw * th, sizeof(u16));
-    u16 max_count = 0;
+    u32 level_max = lv->max_count;
 
     for (u32 r = r0; r < r1; r++) {
         int py = th > 1 ? (int)((u64)(r - r0) * (th - 1) / (vis_rows - 1)) : 0;
@@ -560,22 +569,22 @@ static SpyRenderResult spy_render_level(SpyCtx *spy, u32 level_idx,
         u32 end   = lv->row_ptr[r + 1];
         for (u32 j = start; j < end; j++) {
             u32 col = lv->col_idx[j];
-            if (col < c0 || col >= c1) continue;  // outside viewport
+            if (col < c0 || col >= c1) continue;
             int px = tw > 1 ? (int)((u64)(col - c0) * (tw - 1) / (vis_cols - 1)) : 0;
             int idx = py * tw + px;
             buf[idx] += (u16)(lv->counts[j] > 65535 - buf[idx] ? 65535 - buf[idx] : lv->counts[j]);
-            if (buf[idx] > max_count) max_count = buf[idx];
         }
     }
 
-    // OKLCH color pass
+    // OKLCH color pass (normalized against level max, not viewport max)
     for (u32 i = 0; i < tw * th; i++) {
         if (buf[i] == 0) {
             rgba[i] = 0xFF191919;
         } else {
-            float frac = max_count > 1
-                ? (float)(buf[i] - 1) / (float)(max_count - 1)
+            float frac = level_max > 1
+                ? (float)(buf[i] - 1) / (float)(level_max - 1)
                 : 0.0f;
+            if (frac > 1.0f) frac = 1.0f;  // pixel accumulation can exceed level max
             float hue = 260.0f - frac * 230.0f;
             u8 r, g, b;
             _oklch_to_rgb(0.75f, 0.15f, hue, &r, &g, &b);
