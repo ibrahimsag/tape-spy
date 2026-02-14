@@ -238,9 +238,23 @@ static u32 mlp_forward(MLP *m, u8 *pixels, u8 label) {
     return val_sub(t, val_log(t, se), val_sub(t, m->logits[label], mx));
 }
 
-static void sgd_step(Tape *t, f32 lr) {
-    for (u32 i = 0; i < t->perm_count; i++)
-        t->base[i].data -= lr * t->base[i].grad;
+typedef struct { f32 b1_t, b2_t; } AdamState;
+
+static void adam_step(Tape *t, f32 lr, AdamState *st) {
+    f32 b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+    st->b1_t *= b1;
+    st->b2_t *= b2;
+    f32 bc1 = 1.0f - st->b1_t;
+    f32 bc2 = 1.0f - st->b2_t;
+    for (u32 i = 0; i < t->perm_count; i++) {
+        Node *n = &t->base[i];
+        f32 g = n->grad;
+        n->local_grads[0] = b1 * n->local_grads[0] + (1 - b1) * g;
+        n->local_grads[1] = b2 * n->local_grads[1] + (1 - b2) * g * g;
+        f32 m_hat = n->local_grads[0] / bc1;
+        f32 v_hat = n->local_grads[1] / bc2;
+        n->data -= lr * m_hat / (sqrtf(v_hat) + eps);
+    }
 }
 
 static int mlp_predict(MLP *m) {
@@ -279,6 +293,7 @@ typedef struct {
 static void *train_thread_fn(void *arg) {
     TrainCtx *ctx = arg;
     atomic_store(&ctx->running, true);
+    AdamState adam = { 1.0f, 1.0f };
 
     for (int epoch = 0; !atomic_load(&ctx->stop); epoch++) {
         atomic_store(&ctx->epoch, epoch);
@@ -291,7 +306,7 @@ static void *train_thread_fn(void *arg) {
             tape_reset(&ctx->mlp->tape);
             u32 loss_idx = mlp_forward(ctx->mlp, px, label);
             tape_backward(&ctx->mlp->tape, loss_idx);
-            sgd_step(&ctx->mlp->tape, ctx->lr);
+            adam_step(&ctx->mlp->tape, ctx->lr, &adam);
 
             if (mlp_predict(ctx->mlp) == label)
                 atomic_fetch_add(&ctx->correct, 1);
