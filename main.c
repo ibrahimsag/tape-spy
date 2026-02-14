@@ -489,17 +489,57 @@ static void spy_build_pyramid(SpyCtx *spy) {
 // Render a level into an RGBA pixel buffer (1024x1024)
 #define SPY_CANVAS 1024
 
-typedef struct { u32 w, h; } SpyTexSize;
+typedef struct {
+    u32 tex_w, tex_h;       // texture dimensions (pixels)
+    float quad_x, quad_y;   // quad position on canvas (pixels, may be negative)
+    float quad_w, quad_h;   // quad size on canvas (pixels, may exceed canvas)
+} SpyRenderResult;
 
-static SpyTexSize spy_render_level(SpyCtx *spy, u32 level_idx, u32 *rgba) {
-    SpyTexSize sz = {0, 0};
-    if (level_idx >= spy->num_levels) return sz;
+static SpyRenderResult spy_render_level(SpyCtx *spy, u32 level_idx,
+                                         float cam_x, float cam_y, float cam_span,
+                                         u32 *rgba) {
+    SpyRenderResult res = {0};
+    if (level_idx >= spy->num_levels) return res;
     SpyLevel *lv = &spy->levels[level_idx];
 
-    u32 tw = lv->col_count < SPY_CANVAS ? lv->col_count : SPY_CANVAS;
-    u32 th = lv->row_count < SPY_CANVAS ? lv->row_count : SPY_CANVAS;
-    sz.w = tw;
-    sz.h = th;
+    // visible range in level's row/col space
+    float r0f = cam_y * lv->row_count;
+    float r1f = (cam_y + cam_span) * lv->row_count;
+    float c0f = cam_x * lv->col_count;
+    float c1f = (cam_x + cam_span) * lv->col_count;
+
+    // snap to whole cells (expand outward)
+    u32 r0 = (u32)r0f;
+    u32 r1 = (u32)r1f;
+    if (r1f > (float)r1 || r1 == r0) r1++;  // ceil, at least 1
+    if (r1 > lv->row_count) r1 = lv->row_count;
+
+    u32 c0 = (u32)c0f;
+    u32 c1 = (u32)c1f;
+    if (c1f > (float)c1 || c1 == c0) c1++;
+    if (c1 > lv->col_count) c1 = lv->col_count;
+
+    u32 vis_rows = r1 - r0;
+    u32 vis_cols = c1 - c0;
+
+    // texture dimensions: 1 texel per cell (capped at canvas)
+    u32 tw = vis_cols < SPY_CANVAS ? vis_cols : SPY_CANVAS;
+    u32 th = vis_rows < SPY_CANVAS ? vis_rows : SPY_CANVAS;
+    if (tw == 0) tw = 1;
+    if (th == 0) th = 1;
+    res.tex_w = tw;
+    res.tex_h = th;
+
+    // quad: snapped range mapped to canvas coordinates
+    float snap_x0 = (float)c0 / lv->col_count;
+    float snap_y0 = (float)r0 / lv->row_count;
+    float snap_x1 = (float)c1 / lv->col_count;
+    float snap_y1 = (float)r1 / lv->row_count;
+
+    res.quad_x = (snap_x0 - cam_x) / cam_span * SPY_CANVAS;
+    res.quad_y = (snap_y0 - cam_y) / cam_span * SPY_CANVAS;
+    res.quad_w = (snap_x1 - snap_x0) / cam_span * SPY_CANVAS;
+    res.quad_h = (snap_y1 - snap_y0) / cam_span * SPY_CANVAS;
 
     // clear
     memset(rgba, 0, tw * th * sizeof(u32));
@@ -508,12 +548,14 @@ static SpyTexSize spy_render_level(SpyCtx *spy, u32 level_idx, u32 *rgba) {
     u16 *buf = calloc(tw * th, sizeof(u16));
     u16 max_count = 0;
 
-    for (u32 r = 0; r < lv->row_count; r++) {
-        int py = th > 1 ? (int)((u64)r * (th - 1) / (lv->row_count - 1)) : 0;
+    for (u32 r = r0; r < r1; r++) {
+        int py = th > 1 ? (int)((u64)(r - r0) * (th - 1) / (vis_rows - 1)) : 0;
         u32 start = lv->row_ptr[r];
         u32 end   = lv->row_ptr[r + 1];
         for (u32 j = start; j < end; j++) {
-            int px = tw > 1 ? (int)((u64)lv->col_idx[j] * (tw - 1) / (lv->col_count - 1)) : 0;
+            u32 col = lv->col_idx[j];
+            if (col < c0 || col >= c1) continue;  // outside viewport
+            int px = tw > 1 ? (int)((u64)(col - c0) * (tw - 1) / (vis_cols - 1)) : 0;
             int idx = py * tw + px;
             buf[idx] += (u16)(lv->counts[j] > 65535 - buf[idx] ? 65535 - buf[idx] : lv->counts[j]);
             if (buf[idx] > max_count) max_count = buf[idx];
@@ -535,19 +577,22 @@ static SpyTexSize spy_render_level(SpyCtx *spy, u32 level_idx, u32 *rgba) {
         }
     }
 
-    // diagonal reference
-    u32 diag = tw < th ? tw : th;
-    for (u32 i = 0; i < diag; i++) {
-        int px = tw > 1 ? (int)((u64)i * (tw - 1) / (diag - 1)) : 0;
-        int py = th > 1 ? (int)((u64)i * (th - 1) / (diag - 1)) : 0;
-        int idx = py * tw + px;
+    // diagonal reference: where row_index == col_index in node-space
+    // in the visible window, diagonal passes through cells where (r0+ty) == (c0+tx)
+    for (u32 ty = 0; ty < th; ty++) {
+        // which row in level-space does this texel represent?
+        u32 row = r0 + (vis_rows > 1 ? (u64)ty * (vis_rows - 1) / (th - 1) : 0);
+        // diagonal col == row (since row_count == col_count)
+        if (row < c0 || row >= c1) continue;
+        int px = tw > 1 ? (int)((u64)(row - c0) * (tw - 1) / (vis_cols - 1)) : 0;
+        int idx = ty * tw + px;
         if (buf[idx] == 0) {
             rgba[idx] = 0xFF282828;
         }
     }
 
     free(buf);
-    return sz;
+    return res;
 }
 
 static void dump_tape_spy(Tape *t, const char *path, int S) {
@@ -745,6 +790,10 @@ int main(int argc, char *argv[]) {
     spy.levels = spy_levels;
     u32 spy_level_idx = 0;
     bool spy_dirty = false;
+    float cam_x = 0, cam_y = 0, cam_span = 1.0f;
+    bool cam_dragging = false;
+    float drag_start_x, drag_start_y;  // mouse pos at drag start
+    float drag_cam_x, drag_cam_y;      // cam pos at drag start
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -821,27 +870,73 @@ int main(int argc, char *argv[]) {
                     atomic_store(&train_ctx.dump_requested, true);
                 }
                 if (screen == SCREEN_SPY) {
-                    if (event.key.key == SDLK_UP && spy_level_idx + 1 < spy.num_levels) {
-                        spy_level_idx++;
-                        spy_dirty = true;
-                    }
-                    if (event.key.key == SDLK_DOWN && spy_level_idx > 0) {
-                        spy_level_idx--;
+                    if (event.key.key == SDLK_HOME) {
+                        cam_x = cam_y = 0; cam_span = 1.0f;
                         spy_dirty = true;
                     }
                 }
-                if (screen == SCREEN_VIEW) {
-                    if (event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE) {
-                        if (offset + GRID_COUNT < train_images.count) {
-                            offset += GRID_COUNT;
-                            grid_dirty = true;
-                        }
+            }
+            // spy mouse events
+            if (screen == SCREEN_SPY) {
+                if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+                    float mx = ui.mouse_x, my = ui.mouse_y;
+                    if (mx >= 0 && mx < SPY_CANVAS && my >= 0 && my < SPY_CANVAS) {
+                        // zoom centered on mouse position
+                        float frac_x = mx / SPY_CANVAS;
+                        float frac_y = my / SPY_CANVAS;
+                        float zoom = event.wheel.y > 0 ? 0.8f : 1.25f;
+                        float new_span = cam_span * zoom;
+                        if (new_span < 1.0f / (1 << 20)) new_span = 1.0f / (1 << 20);
+                        if (new_span > 1.0f) new_span = 1.0f;
+                        // adjust cam_x/cam_y so mouse points at same node-space position
+                        float node_x = cam_x + frac_x * cam_span;
+                        float node_y = cam_y + frac_y * cam_span;
+                        cam_x = node_x - frac_x * new_span;
+                        cam_y = node_y - frac_y * new_span;
+                        cam_span = new_span;
+                        // clamp
+                        if (cam_x < 0) cam_x = 0;
+                        if (cam_y < 0) cam_y = 0;
+                        if (cam_x + cam_span > 1.0f) cam_x = 1.0f - cam_span;
+                        if (cam_y + cam_span > 1.0f) cam_y = 1.0f - cam_span;
+                        spy_dirty = true;
                     }
-                    if (event.key.key == SDLK_LEFT) {
-                        if (offset >= GRID_COUNT) offset -= GRID_COUNT;
-                        else offset = 0;
+                }
+                if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
+                    if (ui.mouse_x >= 0 && ui.mouse_x < SPY_CANVAS) {
+                        cam_dragging = true;
+                        drag_start_x = ui.mouse_x;
+                        drag_start_y = ui.mouse_y;
+                        drag_cam_x = cam_x;
+                        drag_cam_y = cam_y;
+                    }
+                }
+                if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
+                    cam_dragging = false;
+                }
+                if (event.type == SDL_EVENT_MOUSE_MOTION && cam_dragging) {
+                    float dx = (ui.mouse_x - drag_start_x) / SPY_CANVAS * cam_span;
+                    float dy = (ui.mouse_y - drag_start_y) / SPY_CANVAS * cam_span;
+                    cam_x = drag_cam_x - dx;
+                    cam_y = drag_cam_y - dy;
+                    if (cam_x < 0) cam_x = 0;
+                    if (cam_y < 0) cam_y = 0;
+                    if (cam_x + cam_span > 1.0f) cam_x = 1.0f - cam_span;
+                    if (cam_y + cam_span > 1.0f) cam_y = 1.0f - cam_span;
+                    spy_dirty = true;
+                }
+            }
+            if (event.type == SDL_EVENT_KEY_DOWN && screen == SCREEN_VIEW) {
+                if (event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE) {
+                    if (offset + GRID_COUNT < train_images.count) {
+                        offset += GRID_COUNT;
                         grid_dirty = true;
                     }
+                }
+                if (event.key.key == SDLK_LEFT) {
+                    if (offset >= GRID_COUNT) offset -= GRID_COUNT;
+                    else offset = 0;
+                    grid_dirty = true;
                 }
             }
         }
@@ -908,6 +1003,7 @@ int main(int argc, char *argv[]) {
                 spy_build_pyramid(&spy);
                 spy_level_idx = 0;
                 spy_dirty = true;
+                cam_x = cam_y = 0; cam_span = 1.0f;
                 prev_screen = SCREEN_VIEW;
                 screen = SCREEN_SPY;
             }
@@ -991,25 +1087,38 @@ int main(int argc, char *argv[]) {
             }
 
         } else if (screen == SCREEN_SPY) {
+            // auto-select level: pick where visible cells ≈ SPY_CANVAS
+            if (spy.num_levels > 0) {
+                spy_level_idx = 0;
+                for (u32 k = 0; k < spy.num_levels; k++) {
+                    u32 vis = (u32)(cam_span * spy.levels[k].row_count + 0.5f);
+                    if (vis <= SPY_CANVAS) { spy_level_idx = k; break; }
+                    spy_level_idx = k;
+                }
+            }
+
             // update spy texture if needed
+            static SpyRenderResult spy_res;
             if (spy_dirty && spy.num_levels > 0) {
-                SpyTexSize sz = spy_render_level(&spy, spy_level_idx, spy_pixels);
+                spy_res = spy_render_level(&spy, spy_level_idx, cam_x, cam_y, cam_span, spy_pixels);
                 // recreate texture if size changed
-                if (sz.w != spy_tex_w || sz.h != spy_tex_h) {
+                if (spy_res.tex_w != spy_tex_w || spy_res.tex_h != spy_tex_h) {
                     if (spy_tex) SDL_DestroyTexture(spy_tex);
                     spy_tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
-                                                SDL_TEXTUREACCESS_STREAMING, sz.w, sz.h);
+                                                SDL_TEXTUREACCESS_STREAMING, spy_res.tex_w, spy_res.tex_h);
                     SDL_SetTextureScaleMode(spy_tex, SDL_SCALEMODE_NEAREST);
-                    spy_tex_w = sz.w;
-                    spy_tex_h = sz.h;
+                    spy_tex_w = spy_res.tex_w;
+                    spy_tex_h = spy_res.tex_h;
                 }
-                SDL_UpdateTexture(spy_tex, NULL, spy_pixels, sz.w * sizeof(u32));
+                SDL_UpdateTexture(spy_tex, NULL, spy_pixels, spy_res.tex_w * sizeof(u32));
                 spy_dirty = false;
             }
 
-            // draw canvas — stretch texture to 1024x1024
-            SDL_FRect spy_dst = {0, 0, 1024, 1024};
-            if (spy_tex) SDL_RenderTexture(renderer, spy_tex, NULL, &spy_dst);
+            // draw canvas — position quad according to snapped cell boundaries
+            if (spy_tex) {
+                SDL_FRect spy_dst = {spy_res.quad_x, spy_res.quad_y, spy_res.quad_w, spy_res.quad_h};
+                SDL_RenderTexture(renderer, spy_tex, NULL, &spy_dst);
+            }
 
             // sidebar
             SpyLevel *lv = &spy.levels[spy_level_idx];
@@ -1022,11 +1131,13 @@ int main(int argc, char *argv[]) {
             snprintf(buf, sizeof(buf), "nnz: %u", lv->nnz);
             ui_label(&ui, &lay, buf, UI_GRAY(160));
 
-            snprintf(buf, sizeof(buf), "nodes: %u", spy.node_count);
+            snprintf(buf, sizeof(buf), "zoom: %.1fx", 1.0f / cam_span);
             ui_label(&ui, &lay, buf, UI_GRAY(160));
             ui_spacer(&lay, 8);
 
-            ui_label(&ui, &lay, "up/down: level", UI_GRAY(100));
+            ui_label(&ui, &lay, "scroll: zoom", UI_GRAY(100));
+            ui_label(&ui, &lay, "drag: pan", UI_GRAY(100));
+            ui_label(&ui, &lay, "home: reset", UI_GRAY(100));
             ui_label(&ui, &lay, "esc: back", UI_GRAY(100));
         }
 
