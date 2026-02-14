@@ -408,35 +408,42 @@ static void spy_build_coarser(SpyCtx *spy, u32 k) {
     dst->col_count = (src->col_count + 1) / 2;
     dst->row_ptr = PUSH_ARRAY(spy->arena, u32, dst->row_count + 1);
 
-    // upper bound on nnz: src->nnz (could be less after merging)
-    u32 *tmp_cols   = PUSH_ARRAY(spy->arena, u32, src->nnz);
-    u32 *tmp_counts = PUSH_ARRAY(spy->arena, u32, src->nnz);
+    // scratch arena for temp arrays (conflict with spy->arena so we get a different one)
+    mem_arena *conflicts[] = { spy->arena };
+    mem_arena_temp scratch = arena_scratch_get(conflicts, 1);
+
+    u32 *out_cols   = PUSH_ARRAY(scratch.arena, u32, src->nnz);
+    u32 *out_counts = PUSH_ARRAY(scratch.arena, u32, src->nnz);
     u32 out_pos = 0;
+
+    // merge buffer sized for max possible per merged row
+    u32 merge_cap = 0;
+    for (u32 sr = 0; sr < src->row_count; sr++) {
+        u32 n = src->row_ptr[sr + 1] - src->row_ptr[sr];
+        if (n > merge_cap) merge_cap = n;
+    }
+    merge_cap = merge_cap * 2 + 1;
+    u32 *merged_cols = PUSH_ARRAY(scratch.arena, u32, merge_cap);
+    u32 *merged_cnts = PUSH_ARRAY(scratch.arena, u32, merge_cap);
 
     for (u32 dr = 0; dr < dst->row_count; dr++) {
         dst->row_ptr[dr] = out_pos;
         u32 sr0 = dr * 2;
         u32 sr1 = dr * 2 + 1;
 
-        // merge two source rows into temp, applying col>>1 and deduplicating
-        // collect entries from both rows
-        u32 merged_cols[64]; // enough for coarse levels
-        u32 merged_cnts[64];
+        // collect entries from both source rows, applying col>>1
         u32 mc = 0;
-
         for (u32 sr = sr0; sr <= sr1 && sr < src->row_count; sr++) {
             u32 start = src->row_ptr[sr];
             u32 end   = src->row_ptr[sr + 1];
             for (u32 j = start; j < end; j++) {
-                if (mc < 64) {
-                    merged_cols[mc] = src->col_idx[j] >> 1;
-                    merged_cnts[mc] = src->counts[j];
-                    mc++;
-                }
+                merged_cols[mc] = src->col_idx[j] >> 1;
+                merged_cnts[mc] = src->counts[j];
+                mc++;
             }
         }
 
-        // sort by col (insertion sort, tiny arrays)
+        // sort by col (insertion sort — small per row)
         for (u32 i = 1; i < mc; i++) {
             u32 c = merged_cols[i], v = merged_cnts[i];
             u32 j = i;
@@ -449,13 +456,13 @@ static void spy_build_coarser(SpyCtx *spy, u32 k) {
             merged_cnts[j] = v;
         }
 
-        // deduplicate
+        // deduplicate into output
         for (u32 i = 0; i < mc; i++) {
-            if (out_pos > dst->row_ptr[dr] && tmp_cols[out_pos - 1] == merged_cols[i]) {
-                tmp_counts[out_pos - 1] += merged_cnts[i];
+            if (out_pos > dst->row_ptr[dr] && out_cols[out_pos - 1] == merged_cols[i]) {
+                out_counts[out_pos - 1] += merged_cnts[i];
             } else {
-                tmp_cols[out_pos] = merged_cols[i];
-                tmp_counts[out_pos] = merged_cnts[i];
+                out_cols[out_pos] = merged_cols[i];
+                out_counts[out_pos] = merged_cnts[i];
                 out_pos++;
             }
         }
@@ -463,14 +470,13 @@ static void spy_build_coarser(SpyCtx *spy, u32 k) {
     dst->row_ptr[dst->row_count] = out_pos;
     dst->nnz = out_pos;
 
-    // compact: copy from temp to properly sized arrays
+    // copy exact-sized results into persistent arena
     dst->col_idx = PUSH_ARRAY(spy->arena, u32, out_pos);
     dst->counts  = PUSH_ARRAY(spy->arena, u32, out_pos);
-    memcpy(dst->col_idx, tmp_cols, out_pos * sizeof(u32));
-    memcpy(dst->counts,  tmp_counts, out_pos * sizeof(u32));
+    memcpy(dst->col_idx, out_cols, out_pos * sizeof(u32));
+    memcpy(dst->counts,  out_counts, out_pos * sizeof(u32));
 
-    // pop the oversized temp arrays (they're at the end of the arena)
-    // we can't easily pop them with this arena, so just leave them — minor waste
+    arena_scratch_release(scratch);
 }
 
 // Build all levels
@@ -655,6 +661,8 @@ typedef struct {
     _Atomic bool running;
     _Atomic bool stop;
     _Atomic bool dump_requested;
+    _Atomic int spy_state;  // 0=idle, 1=requested, 2=ready
+    SpyCtx *spy;
 
     MLP *mlp;
     idx_images *images;
@@ -688,6 +696,13 @@ static void *train_thread_fn(void *arg) {
             if (atomic_load(&ctx->dump_requested)) {
                 dump_tape_spy(tape, "tape_spy.ppm", 4096);
                 atomic_store(&ctx->dump_requested, false);
+            }
+
+            if (atomic_load(&ctx->spy_state) == 1) {
+                arena_clear(ctx->spy->arena);
+                spy_build_level0(ctx->spy, tape);
+                spy_build_pyramid(ctx->spy);
+                atomic_store(&ctx->spy_state, 2);
             }
 
             if (mlp_predict(ctx->mlp) == label)
@@ -785,7 +800,7 @@ int main(int argc, char *argv[]) {
     bool train_thread_active = false;
 
     SpyCtx spy = {0};
-    spy.arena = arena_create(MiB(64), MiB(1));
+    spy.arena = arena_create(MiB(256), MiB(1));
     SpyLevel spy_levels[24] = {0};
     spy.levels = spy_levels;
     u32 spy_level_idx = 0;
@@ -994,6 +1009,7 @@ int main(int argc, char *argv[]) {
                 train_ctx.test_images = &test_images;
                 train_ctx.test_labels = &test_labels;
                 train_ctx.lr = 0.001f;
+                train_ctx.spy = &spy;
                 pthread_create(&train_thread, NULL, train_thread_fn, &train_ctx);
                 train_thread_active = true;
             }
@@ -1077,6 +1093,19 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 ui_advance(&lay, gh);
+            }
+
+            if (ui_lay_button(&ui, &lay, "Spy (tape)", 32)) {
+                atomic_store(&train_ctx.spy_state, 1);
+            }
+            // check if spy data is ready
+            if (atomic_load(&train_ctx.spy_state) == 2) {
+                atomic_store(&train_ctx.spy_state, 0);
+                spy_level_idx = 0;
+                spy_dirty = true;
+                cam_x = cam_y = 0; cam_span = 1.0f;
+                prev_screen = SCREEN_TRAINING;
+                screen = SCREEN_SPY;
             }
 
             if (ui_lay_button(&ui, &lay, "Stop", 32)) {
