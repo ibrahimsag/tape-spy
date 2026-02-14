@@ -267,7 +267,7 @@ static int mlp_predict(MLP *m) {
     return pred;
 }
 
-// --- tape visualization (OKLCH hue-mapped) ---
+// --- OKLCH color ---
 
 static float _srgb_gamma(float c) {
     if (c <= 0.0f) return 0.0f;
@@ -279,7 +279,6 @@ static void _oklch_to_rgb(float L, float C, float h_deg, u8 *ro, u8 *go, u8 *bo)
     float h = h_deg * (3.14159265f / 180.0f);
     float a = C * cosf(h), b = C * sinf(h);
 
-    // OKLab -> LMS (cube root space)
     float l_ = L + 0.3963377774f * a + 0.2158037573f * b;
     float m_ = L - 0.1055613458f * a - 0.0638541728f * b;
     float s_ = L - 0.0894841775f * a - 1.2914855480f * b;
@@ -287,7 +286,6 @@ static void _oklch_to_rgb(float L, float C, float h_deg, u8 *ro, u8 *go, u8 *bo)
     m_ = m_ * m_ * m_;
     s_ = s_ * s_ * s_;
 
-    // LMS -> linear RGB
     float rf = +4.0767416621f * l_ - 3.3077115913f * m_ + 0.2309699292f * s_;
     float gf = -1.2684380046f * l_ + 2.6097574011f * m_ - 0.3413193965f * s_;
     float bf = -0.0041960863f * l_ - 0.7034186147f * m_ + 1.7076147010f * s_;
@@ -295,6 +293,249 @@ static void _oklch_to_rgb(float L, float C, float h_deg, u8 *ro, u8 *go, u8 *bo)
     *ro = (u8)(_srgb_gamma(rf) * 255.0f + 0.5f);
     *go = (u8)(_srgb_gamma(gf) * 255.0f + 0.5f);
     *bo = (u8)(_srgb_gamma(bf) * 255.0f + 0.5f);
+}
+
+// --- spy plot CSR pyramid ---
+
+#define SPY_IDLE    0
+#define SPY_REQUEST 1
+#define SPY_WORKING 2
+#define SPY_READY   3
+
+typedef struct {
+    u32 row_count;
+    u32 col_count;
+    u32 nnz;
+    u32 *row_ptr;   // [row_count + 1]
+    u32 *col_idx;   // [nnz]
+    u32 *counts;    // [nnz]
+} SpyLevel;
+
+typedef struct {
+    mem_arena *arena;
+    SpyLevel *levels;
+    u32 num_levels;
+    u32 node_count;
+    _Atomic int state;
+} SpyCtx;
+
+// Build level 0 CSR from tape snapshot
+static void spy_build_level0(SpyCtx *spy, Tape *t) {
+    u32 N = t->count;
+    spy->node_count = N;
+
+    SpyLevel *lv = &spy->levels[0];
+    lv->row_count = N;
+    lv->col_count = N;
+    lv->row_ptr = PUSH_ARRAY(spy->arena, u32, N + 1);
+
+    // first pass: count entries per row
+    for (u32 i = 0; i <= N; i++) lv->row_ptr[i] = 0;
+    u32 total = 0;
+    for (u32 i = 0; i < N; i++) {
+        lv->row_ptr[i] = total;
+        total += t->base[i].arity;
+    }
+    lv->row_ptr[N] = total;
+    lv->nnz = total;
+
+    lv->col_idx = PUSH_ARRAY(spy->arena, u32, total);
+    lv->counts  = PUSH_ARRAY(spy->arena, u32, total);
+
+    // fill entries (children sorted: smaller index first)
+    u32 pos = 0;
+    for (u32 i = 0; i < N; i++) {
+        Node *n = &t->base[i];
+        if (n->arity == 2 && n->children[0] > n->children[1]) {
+            lv->col_idx[pos] = n->children[1]; lv->counts[pos++] = 1;
+            lv->col_idx[pos] = n->children[0]; lv->counts[pos++] = 1;
+        } else {
+            for (u32 c = 0; c < n->arity; c++) {
+                lv->col_idx[pos] = n->children[c];
+                lv->counts[pos++] = 1;
+            }
+        }
+    }
+}
+
+// Build level 0 from random data for testing
+static void spy_build_random(SpyCtx *spy, u32 N) {
+    spy->node_count = N;
+
+    SpyLevel *lv = &spy->levels[0];
+    lv->row_count = N;
+    lv->col_count = N;
+
+    // each row gets 0-2 entries
+    u32 total = 0;
+    lv->row_ptr = PUSH_ARRAY(spy->arena, u32, N + 1);
+    for (u32 i = 0; i < N; i++) {
+        lv->row_ptr[i] = total;
+        u32 arity = (i == 0) ? 0 : (rng_f32() < 0.1f ? 1 : 2);
+        total += arity;
+    }
+    lv->row_ptr[N] = total;
+    lv->nnz = total;
+
+    lv->col_idx = PUSH_ARRAY(spy->arena, u32, total);
+    lv->counts  = PUSH_ARRAY(spy->arena, u32, total);
+
+    u32 pos = 0;
+    for (u32 i = 0; i < N; i++) {
+        u32 arity = lv->row_ptr[i + 1] - lv->row_ptr[i];
+        u32 cols[2];
+        for (u32 c = 0; c < arity; c++) {
+            // bias children toward nearby indices (diagonal structure)
+            u32 spread = i < 100 ? i : 100;
+            cols[c] = (u32)((i > spread ? i - spread : 0) + (u32)(rng_f32() * spread * 2));
+            if (cols[c] >= N) cols[c] = N - 1;
+        }
+        // sort
+        if (arity == 2 && cols[0] > cols[1]) { u32 tmp = cols[0]; cols[0] = cols[1]; cols[1] = tmp; }
+        for (u32 c = 0; c < arity; c++) {
+            lv->col_idx[pos] = cols[c];
+            lv->counts[pos++] = 1;
+        }
+    }
+}
+
+// Build coarser level k+1 from level k
+static void spy_build_coarser(SpyCtx *spy, u32 k) {
+    SpyLevel *src = &spy->levels[k];
+    SpyLevel *dst = &spy->levels[k + 1];
+
+    dst->row_count = (src->row_count + 1) / 2;
+    dst->col_count = (src->col_count + 1) / 2;
+    dst->row_ptr = PUSH_ARRAY(spy->arena, u32, dst->row_count + 1);
+
+    // upper bound on nnz: src->nnz (could be less after merging)
+    u32 *tmp_cols   = PUSH_ARRAY(spy->arena, u32, src->nnz);
+    u32 *tmp_counts = PUSH_ARRAY(spy->arena, u32, src->nnz);
+    u32 out_pos = 0;
+
+    for (u32 dr = 0; dr < dst->row_count; dr++) {
+        dst->row_ptr[dr] = out_pos;
+        u32 sr0 = dr * 2;
+        u32 sr1 = dr * 2 + 1;
+
+        // merge two source rows into temp, applying col>>1 and deduplicating
+        // collect entries from both rows
+        u32 merged_cols[64]; // enough for coarse levels
+        u32 merged_cnts[64];
+        u32 mc = 0;
+
+        for (u32 sr = sr0; sr <= sr1 && sr < src->row_count; sr++) {
+            u32 start = src->row_ptr[sr];
+            u32 end   = src->row_ptr[sr + 1];
+            for (u32 j = start; j < end; j++) {
+                if (mc < 64) {
+                    merged_cols[mc] = src->col_idx[j] >> 1;
+                    merged_cnts[mc] = src->counts[j];
+                    mc++;
+                }
+            }
+        }
+
+        // sort by col (insertion sort, tiny arrays)
+        for (u32 i = 1; i < mc; i++) {
+            u32 c = merged_cols[i], v = merged_cnts[i];
+            u32 j = i;
+            while (j > 0 && merged_cols[j-1] > c) {
+                merged_cols[j] = merged_cols[j-1];
+                merged_cnts[j] = merged_cnts[j-1];
+                j--;
+            }
+            merged_cols[j] = c;
+            merged_cnts[j] = v;
+        }
+
+        // deduplicate
+        for (u32 i = 0; i < mc; i++) {
+            if (out_pos > dst->row_ptr[dr] && tmp_cols[out_pos - 1] == merged_cols[i]) {
+                tmp_counts[out_pos - 1] += merged_cnts[i];
+            } else {
+                tmp_cols[out_pos] = merged_cols[i];
+                tmp_counts[out_pos] = merged_cnts[i];
+                out_pos++;
+            }
+        }
+    }
+    dst->row_ptr[dst->row_count] = out_pos;
+    dst->nnz = out_pos;
+
+    // compact: copy from temp to properly sized arrays
+    dst->col_idx = PUSH_ARRAY(spy->arena, u32, out_pos);
+    dst->counts  = PUSH_ARRAY(spy->arena, u32, out_pos);
+    memcpy(dst->col_idx, tmp_cols, out_pos * sizeof(u32));
+    memcpy(dst->counts,  tmp_counts, out_pos * sizeof(u32));
+
+    // pop the oversized temp arrays (they're at the end of the arena)
+    // we can't easily pop them with this arena, so just leave them — minor waste
+}
+
+// Build all levels
+static void spy_build_pyramid(SpyCtx *spy) {
+    u32 max_dim = spy->levels[0].row_count;
+    spy->num_levels = 1;
+    while (max_dim > 1 && spy->num_levels < 24) {
+        spy_build_coarser(spy, spy->num_levels - 1);
+        spy->num_levels++;
+        max_dim = (max_dim + 1) / 2;
+    }
+    printf("spy: built %u levels, level 0: %u rows, %u nnz\n",
+           spy->num_levels, spy->levels[0].row_count, spy->levels[0].nnz);
+}
+
+// Render a level into an RGBA pixel buffer (1024x1024)
+#define SPY_CANVAS 1024
+
+static void spy_render_level(SpyCtx *spy, u32 level_idx, u32 *rgba) {
+    if (level_idx >= spy->num_levels) return;
+    SpyLevel *lv = &spy->levels[level_idx];
+
+    // clear to black
+    memset(rgba, 0, SPY_CANVAS * SPY_CANVAS * sizeof(u32));
+
+    // accumulate into u16 count buffer
+    u16 *buf = calloc(SPY_CANVAS * SPY_CANVAS, sizeof(u16));
+    u16 max_count = 0;
+
+    for (u32 r = 0; r < lv->row_count; r++) {
+        int py = (int)((u64)r * (SPY_CANVAS - 1) / lv->row_count);
+        u32 start = lv->row_ptr[r];
+        u32 end   = lv->row_ptr[r + 1];
+        for (u32 j = start; j < end; j++) {
+            int px = (int)((u64)lv->col_idx[j] * (SPY_CANVAS - 1) / lv->col_count);
+            int idx = py * SPY_CANVAS + px;
+            buf[idx] += (u16)(lv->counts[j] > 65535 - buf[idx] ? 65535 - buf[idx] : lv->counts[j]);
+            if (buf[idx] > max_count) max_count = buf[idx];
+        }
+    }
+
+    // OKLCH color pass
+    for (int i = 0; i < SPY_CANVAS * SPY_CANVAS; i++) {
+        if (buf[i] == 0) {
+            rgba[i] = 0xFF191919; // dark gray background
+        } else {
+            float frac = max_count > 1
+                ? (float)(buf[i] - 1) / (float)(max_count - 1)
+                : 0.0f;
+            float hue = 260.0f - frac * 230.0f;
+            u8 r, g, b;
+            _oklch_to_rgb(0.75f, 0.15f, hue, &r, &g, &b);
+            rgba[i] = 0xFF000000 | ((u32)b << 16) | ((u32)g << 8) | r; // ABGR
+        }
+    }
+
+    // diagonal reference
+    for (int i = 0; i < SPY_CANVAS; i++) {
+        int idx = i * SPY_CANVAS + i;
+        if (buf[idx] == 0) {
+            rgba[idx] = 0xFF282828;
+        }
+    }
+
+    free(buf);
 }
 
 static void dump_tape_spy(Tape *t, const char *path, int S) {
@@ -437,7 +678,7 @@ static void *train_thread_fn(void *arg) {
 typedef enum {
     SCREEN_VIEW,
     SCREEN_TRAINING,
-    SCREEN_RESULTS,
+    SCREEN_SPY,
 } Screen;
 
 #define GRID_COLS 20
@@ -485,6 +726,13 @@ int main(int argc, char *argv[]) {
     TrainCtx train_ctx = {0};
     pthread_t train_thread;
     bool train_thread_active = false;
+
+    SpyCtx spy = {0};
+    spy.arena = arena_create(MiB(64), MiB(1));
+    SpyLevel spy_levels[24] = {0};
+    spy.levels = spy_levels;
+    u32 spy_level_idx = 0;
+    bool spy_dirty = false;
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -534,6 +782,13 @@ int main(int argc, char *argv[]) {
     u32 offset = 0;
     bool grid_dirty = true;
 
+    // spy texture (1024x1024)
+    SDL_Texture *spy_tex = SDL_CreateTexture(
+        renderer, SDL_PIXELFORMAT_ABGR8888,
+        SDL_TEXTUREACCESS_STREAMING, SPY_CANVAS, SPY_CANVAS
+    );
+    u32 *spy_pixels = PUSH_ARRAY(arena, u32, SPY_CANVAS * SPY_CANVAS);
+    Screen prev_screen = SCREEN_VIEW;
     Screen screen = SCREEN_VIEW;
 
     bool running = true;
@@ -547,11 +802,23 @@ int main(int argc, char *argv[]) {
                 running = false;
             }
             if (event.type == SDL_EVENT_KEY_DOWN) {
-                if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_Q) {
+                if (screen == SCREEN_SPY && event.key.key == SDLK_ESCAPE) {
+                    screen = prev_screen;
+                } else if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_Q) {
                     running = false;
                 }
                 if (event.key.key == SDLK_D && screen == SCREEN_TRAINING) {
                     atomic_store(&train_ctx.dump_requested, true);
+                }
+                if (screen == SCREEN_SPY) {
+                    if (event.key.key == SDLK_UP && spy_level_idx + 1 < spy.num_levels) {
+                        spy_level_idx++;
+                        spy_dirty = true;
+                    }
+                    if (event.key.key == SDLK_DOWN && spy_level_idx > 0) {
+                        spy_level_idx--;
+                        spy_dirty = true;
+                    }
                 }
                 if (screen == SCREEN_VIEW) {
                     if (event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE) {
@@ -581,9 +848,11 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(renderer, 25, 25, 25, 255);
         SDL_RenderClear(renderer);
 
-        // MNIST grid on the left
-        SDL_FRect grid_dst = {0, 0, grid_pixel_w, grid_pixel_h};
-        SDL_RenderTexture(renderer, grid_tex, NULL, &grid_dst);
+        // MNIST grid on the left (not in spy mode)
+        if (screen != SCREEN_SPY) {
+            SDL_FRect grid_dst = {0, 0, grid_pixel_w, grid_pixel_h};
+            SDL_RenderTexture(renderer, grid_tex, NULL, &grid_dst);
+        }
 
         // right panel
         UILayout lay = ui_layout(win_w - panel_w + 16, 16, panel_w - 32, 6);
@@ -622,6 +891,15 @@ int main(int argc, char *argv[]) {
                 train_ctx.lr = 0.001f;
                 pthread_create(&train_thread, NULL, train_thread_fn, &train_ctx);
                 train_thread_active = true;
+            }
+            if (ui_lay_button(&ui, &lay, "Spy (random)", 36)) {
+                arena_clear(spy.arena);
+                spy_build_random(&spy, 100000);
+                spy_build_pyramid(&spy);
+                spy_level_idx = 0;
+                spy_dirty = true;
+                prev_screen = SCREEN_VIEW;
+                screen = SCREEN_SPY;
             }
             ui_spacer(&lay, 8);
 
@@ -701,6 +979,36 @@ int main(int argc, char *argv[]) {
                 train_thread_active = false;
                 screen = SCREEN_VIEW;
             }
+
+        } else if (screen == SCREEN_SPY) {
+            // update spy texture if needed
+            if (spy_dirty && spy.num_levels > 0) {
+                spy_render_level(&spy, spy_level_idx, spy_pixels);
+                SDL_UpdateTexture(spy_tex, NULL, spy_pixels, SPY_CANVAS * sizeof(u32));
+                spy_dirty = false;
+            }
+
+            // draw canvas
+            SDL_FRect spy_dst = {0, 0, 1024, 1024};
+            SDL_RenderTexture(renderer, spy_tex, NULL, &spy_dst);
+
+            // sidebar
+            SpyLevel *lv = &spy.levels[spy_level_idx];
+            snprintf(buf, sizeof(buf), "level %u / %u", spy_level_idx, spy.num_levels - 1);
+            ui_label(&ui, &lay, buf, UI_WHITE);
+
+            snprintf(buf, sizeof(buf), "rows: %u  cols: %u", lv->row_count, lv->col_count);
+            ui_label(&ui, &lay, buf, UI_GRAY(160));
+
+            snprintf(buf, sizeof(buf), "nnz: %u", lv->nnz);
+            ui_label(&ui, &lay, buf, UI_GRAY(160));
+
+            snprintf(buf, sizeof(buf), "nodes: %u", spy.node_count);
+            ui_label(&ui, &lay, buf, UI_GRAY(160));
+            ui_spacer(&lay, 8);
+
+            ui_label(&ui, &lay, "up/down: level", UI_GRAY(100));
+            ui_label(&ui, &lay, "esc: back", UI_GRAY(100));
         }
 
         SDL_RenderPresent(renderer);
@@ -713,7 +1021,9 @@ int main(int argc, char *argv[]) {
     }
     tape_destroy(&mlp.tape);
 
+    arena_destroy(spy.arena);
     ui_destroy(&ui);
+    SDL_DestroyTexture(spy_tex);
     SDL_DestroyTexture(grid_tex);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
