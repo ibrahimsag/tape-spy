@@ -104,9 +104,10 @@ static f32 rng_normal(void) {
 
 // --- MLP (784 -> 128 -> 10) ---
 
-#define MLP_IN  784
-#define MLP_HID 128
-#define MLP_OUT 10
+#define MLP_IN   784
+#define MLP_HID1 128
+#define MLP_HID2 64
+#define MLP_OUT  10
 
 typedef struct {
     u32 start;    // first weight param index in tape
@@ -118,7 +119,7 @@ typedef struct {
 
 typedef struct {
     Tape tape;
-    Layer l1, l2;
+    Layer l1, l2, l3;
     u32 logits[MLP_OUT]; // filled by mlp_forward
 } MLP;
 
@@ -127,15 +128,21 @@ static MLP mlp_create(void) {
     m.tape = tape_create(MiB(64));
 
     // Layer 1: 784 -> 128 (He init)
-    m.l1 = (Layer){ .start = m.tape.count, .in_dim = MLP_IN, .out_dim = MLP_HID };
+    m.l1 = (Layer){ .start = m.tape.count, .in_dim = MLP_IN, .out_dim = MLP_HID1 };
     f32 s1 = sqrtf(2.0f / MLP_IN);
-    for (u32 i = 0; i < MLP_HID * MLP_IN; i++) tape_param(&m.tape, rng_normal() * s1);
-    for (u32 i = 0; i < MLP_HID; i++) tape_param(&m.tape, 0.0f);
+    for (u32 i = 0; i < MLP_HID1 * MLP_IN; i++) tape_param(&m.tape, rng_normal() * s1);
+    for (u32 i = 0; i < MLP_HID1; i++) tape_param(&m.tape, 0.0f);
 
-    // Layer 2: 128 -> 10
-    m.l2 = (Layer){ .start = m.tape.count, .in_dim = MLP_HID, .out_dim = MLP_OUT };
-    f32 s2 = sqrtf(2.0f / MLP_HID);
-    for (u32 i = 0; i < MLP_OUT * MLP_HID; i++) tape_param(&m.tape, rng_normal() * s2);
+    // Layer 2: 128 -> 64
+    m.l2 = (Layer){ .start = m.tape.count, .in_dim = MLP_HID1, .out_dim = MLP_HID2 };
+    f32 s2 = sqrtf(2.0f / MLP_HID1);
+    for (u32 i = 0; i < MLP_HID2 * MLP_HID1; i++) tape_param(&m.tape, rng_normal() * s2);
+    for (u32 i = 0; i < MLP_HID2; i++) tape_param(&m.tape, 0.0f);
+
+    // Layer 3: 64 -> 10
+    m.l3 = (Layer){ .start = m.tape.count, .in_dim = MLP_HID2, .out_dim = MLP_OUT };
+    f32 s3 = sqrtf(2.0f / MLP_HID2);
+    for (u32 i = 0; i < MLP_OUT * MLP_HID2; i++) tape_param(&m.tape, rng_normal() * s3);
     for (u32 i = 0; i < MLP_OUT; i++) tape_param(&m.tape, 0.0f);
 
     return m;
@@ -161,12 +168,17 @@ static u32 mlp_forward(MLP *m, u8 *pixels, u8 label) {
         inp[i] = tape_leaf(t, (f32)pixels[i] / 255.0f);
 
     // Layer 1 + ReLU
-    u32 hid[MLP_HID];
-    linear_fwd(t, &m->l1, inp, hid);
-    for (u32 i = 0; i < MLP_HID; i++) hid[i] = val_relu(t, hid[i]);
+    u32 h1[MLP_HID1];
+    linear_fwd(t, &m->l1, inp, h1);
+    for (u32 i = 0; i < MLP_HID1; i++) h1[i] = val_relu(t, h1[i]);
 
-    // Layer 2 (logits)
-    linear_fwd(t, &m->l2, hid, m->logits);
+    // Layer 2 + ReLU
+    u32 h2[MLP_HID2];
+    linear_fwd(t, &m->l2, h1, h2);
+    for (u32 i = 0; i < MLP_HID2; i++) h2[i] = val_relu(t, h2[i]);
+
+    // Layer 3 (logits)
+    linear_fwd(t, &m->l3, h2, m->logits);
 
     // Cross-entropy via log-softmax (numerically stable)
     f32 max_v = tape_data(t, m->logits[0]);
@@ -456,7 +468,7 @@ int main(int argc, char *argv[]) {
                 train_ctx.labels = &train_labels;
                 train_ctx.test_images = &test_images;
                 train_ctx.test_labels = &test_labels;
-                train_ctx.lr = 0.01f;
+                train_ctx.lr = 0.001f;
                 pthread_create(&train_thread, NULL, train_thread_fn, &train_ctx);
                 train_thread_active = true;
             }
