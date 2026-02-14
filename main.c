@@ -245,23 +245,25 @@ static void *train_thread_fn(void *arg) {
 
             atomic_store(&ctx->step, (int)i + 1);
             atomic_store(&ctx->loss, tape_data(&ctx->mlp->tape, loss_idx));
-        }
 
-        // evaluate on test set
-        int test_correct = 0;
-        for (u32 i = 0; i < ctx->test_images->count && !atomic_load(&ctx->stop); i++) {
-            u8 *px = ctx->test_images->pixels + (u64)i * 784;
-            u8 label = ctx->test_labels->labels[i];
-            tape_reset(&ctx->mlp->tape);
-            mlp_forward(ctx->mlp, px, label);
-            if (mlp_predict(ctx->mlp) == label) test_correct++;
-        }
-        if (!atomic_load(&ctx->stop)) {
-            float ta = 100.0f * test_correct / (int)ctx->test_images->count;
-            atomic_store(&ctx->test_acc, ta);
-            int hc = atomic_load(&ctx->hist_count);
-            ctx->hist[hc % ACC_HIST] = ta;
-            atomic_store(&ctx->hist_count, hc + 1);
+            // evaluate on test set every 10K steps
+            if ((i + 1) % 10000 == 0) {
+                int test_correct = 0;
+                for (u32 j = 0; j < ctx->test_images->count && !atomic_load(&ctx->stop); j++) {
+                    u8 *tpx = ctx->test_images->pixels + (u64)j * 784;
+                    u8 tlbl = ctx->test_labels->labels[j];
+                    tape_reset(&ctx->mlp->tape);
+                    mlp_forward(ctx->mlp, tpx, tlbl);
+                    if (mlp_predict(ctx->mlp) == tlbl) test_correct++;
+                }
+                if (!atomic_load(&ctx->stop)) {
+                    float ta = 100.0f * test_correct / (int)ctx->test_images->count;
+                    atomic_store(&ctx->test_acc, ta);
+                    int hc = atomic_load(&ctx->hist_count);
+                    ctx->hist[hc % ACC_HIST] = ta;
+                    atomic_store(&ctx->hist_count, hc + 1);
+                }
+            }
         }
     }
 
