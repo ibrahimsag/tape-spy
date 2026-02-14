@@ -1160,11 +1160,142 @@ static int gpt_main(void) {
     return 0;
 }
 
+// --- GPT training thread ---
+
+#define GPT_LOSS_HIST 128
+#define GPT_NUM_SAMPLES 10
+
+typedef struct {
+    _Atomic int step;
+    _Atomic float loss;
+    _Atomic float lr;
+    _Atomic bool running;
+    _Atomic bool stop;
+    _Atomic int spy_state;  // 0=idle, 1=requested, 2=ready
+    SpyCtx *spy;
+
+    _Atomic int loss_hist_count;
+    float loss_hist[GPT_LOSS_HIST];
+
+    _Atomic int gen_state;  // 0=idle, 1=requested, 2=ready
+    char samples[GPT_NUM_SAMPLES][GPT_BLOCK + 1];
+
+    GPT *gpt;
+    NamesDataset *names;
+} GPTTrainCtx;
+
+static void *gpt_train_thread_fn(void *arg) {
+    GPTTrainCtx *ctx = arg;
+    atomic_store(&ctx->running, true);
+
+    GPT *g = ctx->gpt;
+    Tape *t = &g->tape;
+    int num_steps = 500;
+    f32 lr_base = 0.01f;
+    AdamState adam = { 1.0f, 1.0f };
+
+    for (int step = 0; !atomic_load(&ctx->stop); step++) {
+        // Handle generation request
+        if (atomic_load(&ctx->gen_state) == 1) {
+            const char uchars[] = "abcdefghijklmnopqrstuvwxyz";
+            f32 temperature = 0.5f;
+            for (int s = 0; s < GPT_NUM_SAMPLES; s++) {
+                tape_reset(t);
+                u32 kc[GPT_BLOCK][GPT_EMBD], vc[GPT_BLOCK][GPT_EMBD];
+                u32 token = GPT_BOS;
+                int len = 0;
+                for (int pos = 0; pos < GPT_BLOCK; pos++) {
+                    u32 logits[GPT_VOCAB];
+                    gpt_forward_pos(g, token, pos, kc, vc, logits);
+                    u32 scaled[GPT_VOCAB];
+                    u32 inv_temp = tape_leaf(t, 1.0f / temperature);
+                    for (u32 i = 0; i < GPT_VOCAB; i++)
+                        scaled[i] = val_mul(t, logits[i], inv_temp);
+                    u32 probs[GPT_VOCAB];
+                    gpt_softmax(t, scaled, GPT_VOCAB, probs);
+                    f32 r = rng_f32();
+                    f32 cumsum = 0;
+                    u32 chosen = GPT_BOS;
+                    for (u32 i = 0; i < GPT_VOCAB; i++) {
+                        cumsum += tape_data(t, probs[i]);
+                        if (r < cumsum) { chosen = i; break; }
+                    }
+                    if (chosen == GPT_BOS) break;
+                    ctx->samples[s][len++] = uchars[chosen];
+                    token = chosen;
+                }
+                ctx->samples[s][len] = '\0';
+            }
+            atomic_store(&ctx->gen_state, 2);
+            continue;
+        }
+
+        tape_reset(t);
+        tape_zero_grad(t);
+
+        // Tokenize
+        const char *doc = ctx->names->names[step % ctx->names->count];
+        int doc_len = (int)strlen(doc);
+        u32 tokens[256];
+        tokens[0] = GPT_BOS;
+        int tok_len = 1;
+        for (int i = 0; i < doc_len; i++)
+            tokens[tok_len++] = (u32)(doc[i] - 'a');
+        tokens[tok_len++] = GPT_BOS;
+
+        int n = tok_len - 1;
+        if (n > GPT_BLOCK) n = GPT_BLOCK;
+
+        u32 key_cache[GPT_BLOCK][GPT_EMBD];
+        u32 val_cache[GPT_BLOCK][GPT_EMBD];
+        u32 loss_nodes[GPT_BLOCK];
+
+        for (int pos = 0; pos < n; pos++) {
+            u32 logits[GPT_VOCAB];
+            gpt_forward_pos(g, tokens[pos], pos, key_cache, val_cache, logits);
+            loss_nodes[pos] = gpt_cross_entropy(t, logits, tokens[pos + 1]);
+        }
+
+        u32 total_loss = loss_nodes[0];
+        for (int pos = 1; pos < n; pos++)
+            total_loss = val_add(t, total_loss, loss_nodes[pos]);
+        u32 inv_n = tape_leaf(t, 1.0f / (f32)n);
+        u32 avg_loss = val_mul(t, total_loss, inv_n);
+
+        tape_backward(t, avg_loss);
+
+        // Spy capture
+        if (atomic_load(&ctx->spy_state) == 1) {
+            arena_clear(ctx->spy->arena);
+            spy_build_level0(ctx->spy, t);
+            spy_build_pyramid(ctx->spy);
+            atomic_store(&ctx->spy_state, 2);
+        }
+
+        int lr_step = step < num_steps ? step : num_steps;
+        f32 lr_t = lr_base * 0.5f * (1.0f + cosf(3.14159265f * (f32)lr_step / (f32)num_steps));
+        gpt_adam_step(t, lr_t, &adam);
+
+        f32 loss_val = tape_data(t, avg_loss);
+        atomic_store(&ctx->step, step + 1);
+        atomic_store(&ctx->loss, loss_val);
+        atomic_store(&ctx->lr, lr_t);
+
+        int hc = atomic_load(&ctx->loss_hist_count);
+        ctx->loss_hist[hc % GPT_LOSS_HIST] = loss_val;
+        atomic_store(&ctx->loss_hist_count, hc + 1);
+    }
+
+    atomic_store(&ctx->running, false);
+    return NULL;
+}
+
 // --- app state ---
 
 typedef enum {
     SCREEN_VIEW,
     SCREEN_TRAINING,
+    SCREEN_GPT_TRAINING,
     SCREEN_SPY,
 } Screen;
 
@@ -1214,6 +1345,19 @@ int main(int argc, char *argv[]) {
     TrainCtx train_ctx = {0};
     pthread_t train_thread;
     bool train_thread_active = false;
+
+    // GPT
+    NamesDataset names = names_load(arena);
+    bool gpt_available = (names.names != NULL);
+    GPT gpt = {0};
+    if (gpt_available) {
+        names_shuffle(&names);
+        gpt = gpt_create();
+        printf("GPT: %u docs, %u params\n", names.count, gpt.tape.perm_count);
+    }
+    GPTTrainCtx gpt_ctx = {0};
+    pthread_t gpt_thread;
+    bool gpt_thread_active = false;
 
     SpyCtx spy = {0};
     spy.arena = arena_create(MiB(256), MiB(1));
@@ -1430,6 +1574,15 @@ int main(int argc, char *argv[]) {
                 pthread_create(&train_thread, NULL, train_thread_fn, &train_ctx);
                 train_thread_active = true;
             }
+            if (gpt_available && ui_lay_button(&ui, &lay, "Train GPT", 36)) {
+                screen = SCREEN_GPT_TRAINING;
+                gpt_ctx = (GPTTrainCtx){0};
+                gpt_ctx.gpt = &gpt;
+                gpt_ctx.names = &names;
+                gpt_ctx.spy = &spy;
+                pthread_create(&gpt_thread, NULL, gpt_train_thread_fn, &gpt_ctx);
+                gpt_thread_active = true;
+            }
             if (ui_lay_button(&ui, &lay, "Spy (random)", 36)) {
                 arena_clear(spy.arena);
                 spy_build_random(&spy, 100000);
@@ -1532,6 +1685,97 @@ int main(int argc, char *argv[]) {
                 screen = SCREEN_VIEW;
             }
 
+        } else if (screen == SCREEN_GPT_TRAINING) {
+            int gs = atomic_load(&gpt_ctx.step);
+            float gloss = atomic_load(&gpt_ctx.loss);
+            float glr = atomic_load(&gpt_ctx.lr);
+
+            snprintf(buf, sizeof(buf), "GPT  step %d", gs);
+            ui_label(&ui, &lay, buf, UI_RGB(100, 200, 100));
+
+            snprintf(buf, sizeof(buf), "loss: %.4f", gloss);
+            ui_label(&ui, &lay, buf, UI_GRAY(160));
+
+            snprintf(buf, sizeof(buf), "lr: %.5f", glr);
+            ui_label(&ui, &lay, buf, UI_GRAY(120));
+            ui_spacer(&lay, 6);
+
+            // Loss graph
+            {
+                float gx = lay.x, gy = lay.y, gw = lay.w, gh = 80;
+                ui_rect(&ui, gx, gy, gw, gh, UI_GRAY(35));
+                ui_rect_outline(&ui, gx, gy, gw, gh, UI_GRAY(60));
+
+                int hc = atomic_load(&gpt_ctx.loss_hist_count);
+                int show = hc < GPT_LOSS_HIST ? hc : GPT_LOSS_HIST;
+                int start = hc < GPT_LOSS_HIST ? 0 : hc - GPT_LOSS_HIST;
+
+                if (show > 0) {
+                    float ymin = 1e9, ymax = -1e9;
+                    for (int i = 0; i < show; i++) {
+                        float v = gpt_ctx.loss_hist[(start + i) % GPT_LOSS_HIST];
+                        if (v < ymin) ymin = v;
+                        if (v > ymax) ymax = v;
+                    }
+                    float pad = (ymax - ymin) * 0.1f;
+                    if (pad < 0.1f) pad = 0.1f;
+                    ymin -= pad; ymax += pad;
+                    if (ymin < 0) ymin = 0;
+                    float yrange = ymax - ymin;
+                    if (yrange < 0.1f) yrange = 0.1f;
+
+                    snprintf(buf, sizeof(buf), "%.1f", ymax);
+                    ui_text(&ui, buf, gx + 2, gy, UI_GRAY(100));
+                    snprintf(buf, sizeof(buf), "%.1f", ymin);
+                    ui_text(&ui, buf, gx + 2, gy + gh - 16, UI_GRAY(100));
+
+                    for (int i = 0; i < show; i++) {
+                        float v = gpt_ctx.loss_hist[(start + i) % GPT_LOSS_HIST];
+                        float x0 = gx + (show > 1 ? (float)i / (show - 1) * gw : gw * 0.5f);
+                        float y0 = gy + gh - (v - ymin) / yrange * gh;
+                        ui_rect(&ui, x0 - 1, y0 - 1, 3, 3, UI_RGB(255, 180, 80));
+                        if (i > 0) {
+                            float vp = gpt_ctx.loss_hist[(start + i - 1) % GPT_LOSS_HIST];
+                            float xp = gx + (float)(i - 1) / (show - 1) * gw;
+                            float yp = gy + gh - (vp - ymin) / yrange * gh;
+                            ui_line(&ui, xp, yp, x0, y0, UI_RGB(255, 180, 80));
+                        }
+                    }
+                }
+                ui_advance(&lay, gh);
+            }
+            ui_spacer(&lay, 4);
+
+            if (ui_lay_button(&ui, &lay, "Generate", 32)) {
+                if (atomic_load(&gpt_ctx.gen_state) != 1)
+                    atomic_store(&gpt_ctx.gen_state, 1);
+            }
+
+            if (atomic_load(&gpt_ctx.gen_state) == 2) {
+                for (int i = 0; i < GPT_NUM_SAMPLES; i++)
+                    ui_label(&ui, &lay, gpt_ctx.samples[i], UI_RGB(255, 220, 100));
+            }
+            ui_spacer(&lay, 4);
+
+            if (ui_lay_button(&ui, &lay, "Spy (tape)", 32)) {
+                atomic_store(&gpt_ctx.spy_state, 1);
+            }
+            if (atomic_load(&gpt_ctx.spy_state) == 2) {
+                atomic_store(&gpt_ctx.spy_state, 0);
+                spy_level_idx = 0;
+                spy_dirty = true;
+                cam_x = cam_y = 0; cam_span = 1.0f;
+                prev_screen = SCREEN_GPT_TRAINING;
+                screen = SCREEN_SPY;
+            }
+
+            if (ui_lay_button(&ui, &lay, "Stop", 32)) {
+                atomic_store(&gpt_ctx.stop, true);
+                pthread_join(gpt_thread, NULL);
+                gpt_thread_active = false;
+                screen = SCREEN_VIEW;
+            }
+
         } else if (screen == SCREEN_SPY) {
             // auto-select level: pick where visible cells ≈ SPY_CANVAS
             if (spy.num_levels > 0) {
@@ -1595,7 +1839,12 @@ int main(int argc, char *argv[]) {
         atomic_store(&train_ctx.stop, true);
         pthread_join(train_thread, NULL);
     }
+    if (gpt_thread_active) {
+        atomic_store(&gpt_ctx.stop, true);
+        pthread_join(gpt_thread, NULL);
+    }
     tape_destroy(&mlp.tape);
+    if (gpt_available) tape_destroy(&gpt.tape);
 
     arena_destroy(spy.arena);
     ui_destroy(&ui);
