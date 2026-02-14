@@ -756,6 +756,410 @@ static void *train_thread_fn(void *arg) {
     return NULL;
 }
 
+// --- GPT (character-level, matching microgpt.py) ---
+
+#define GPT_EMBD       16
+#define GPT_HEAD       4
+#define GPT_BLOCK      8
+#define GPT_HDIM       (GPT_EMBD / GPT_HEAD)
+#define GPT_VOCAB      27
+#define GPT_BOS        26
+#define GPT_MLP_HIDDEN (4 * GPT_EMBD)
+
+typedef struct {
+    Tape tape;
+    u32 wte;        // [GPT_VOCAB][GPT_EMBD]
+    u32 wpe;        // [GPT_BLOCK][GPT_EMBD]
+    u32 attn_wq;    // [GPT_EMBD][GPT_EMBD]
+    u32 attn_wk;    // [GPT_EMBD][GPT_EMBD]
+    u32 attn_wv;    // [GPT_EMBD][GPT_EMBD]
+    u32 attn_wo;    // [GPT_EMBD][GPT_EMBD]
+    u32 mlp_fc1;    // [GPT_MLP_HIDDEN][GPT_EMBD]
+    u32 mlp_fc2;    // [GPT_EMBD][GPT_MLP_HIDDEN]
+    u32 lm_head;    // [GPT_VOCAB][GPT_EMBD]
+} GPT;
+
+typedef struct {
+    char **names;
+    u32 count;
+} NamesDataset;
+
+static NamesDataset names_load(mem_arena *arena) {
+    NamesDataset ds = {0};
+    const char *path = "data/names.txt";
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "missing %s — download from:\n"
+                "  https://raw.githubusercontent.com/karpathy/makemore/refs/heads/master/names.txt\n", path);
+        return ds;
+    }
+
+    // First pass: count lines
+    char line[256];
+    u32 count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
+        if (len > 0) count++;
+    }
+
+    ds.names = PUSH_ARRAY(arena, char*, count);
+    ds.count = count;
+
+    // Second pass: store names (lowercased)
+    rewind(f);
+    u32 idx = 0;
+    while (fgets(line, sizeof(line), f) && idx < count) {
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
+        if (len == 0) continue;
+        for (int i = 0; i < len; i++)
+            if (line[i] >= 'A' && line[i] <= 'Z') line[i] += 32;
+        char *name = PUSH_ARRAY_NZ(arena, char, len + 1);
+        memcpy(name, line, len);
+        name[len] = '\0';
+        ds.names[idx++] = name;
+    }
+    fclose(f);
+    return ds;
+}
+
+static void names_shuffle(NamesDataset *ds) {
+    for (u32 i = ds->count - 1; i > 0; i--) {
+        u32 j = (u32)(rng_f32() * (i + 1));
+        if (j > i) j = i;
+        char *tmp = ds->names[i];
+        ds->names[i] = ds->names[j];
+        ds->names[j] = tmp;
+    }
+}
+
+static GPT gpt_create(void) {
+    GPT g;
+    g.tape = tape_create(MiB(64));
+    f32 std = 0.02f;
+
+    g.wte = g.tape.count;
+    for (u32 i = 0; i < GPT_VOCAB * GPT_EMBD; i++)
+        tape_param(&g.tape, rng_normal() * std);
+
+    g.wpe = g.tape.count;
+    for (u32 i = 0; i < GPT_BLOCK * GPT_EMBD; i++)
+        tape_param(&g.tape, rng_normal() * std);
+
+    g.attn_wq = g.tape.count;
+    for (u32 i = 0; i < GPT_EMBD * GPT_EMBD; i++)
+        tape_param(&g.tape, rng_normal() * std);
+
+    g.attn_wk = g.tape.count;
+    for (u32 i = 0; i < GPT_EMBD * GPT_EMBD; i++)
+        tape_param(&g.tape, rng_normal() * std);
+
+    g.attn_wv = g.tape.count;
+    for (u32 i = 0; i < GPT_EMBD * GPT_EMBD; i++)
+        tape_param(&g.tape, rng_normal() * std);
+
+    g.attn_wo = g.tape.count;
+    for (u32 i = 0; i < GPT_EMBD * GPT_EMBD; i++)
+        tape_param(&g.tape, 0.0f);  // zero init
+
+    g.mlp_fc1 = g.tape.count;
+    for (u32 i = 0; i < GPT_MLP_HIDDEN * GPT_EMBD; i++)
+        tape_param(&g.tape, rng_normal() * std);
+
+    g.mlp_fc2 = g.tape.count;
+    for (u32 i = 0; i < GPT_EMBD * GPT_MLP_HIDDEN; i++)
+        tape_param(&g.tape, 0.0f);  // zero init
+
+    g.lm_head = g.tape.count;
+    for (u32 i = 0; i < GPT_VOCAB * GPT_EMBD; i++)
+        tape_param(&g.tape, rng_normal() * std);
+
+    return g;
+}
+
+// Linear without bias: out[i] = sum_j(w[i*in_dim + j] * x[j])
+static void gpt_linear(Tape *t, u32 w_start, u32 *x, u32 in_dim, u32 *out, u32 out_dim) {
+    for (u32 i = 0; i < out_dim; i++) {
+        u32 w = w_start + i * in_dim;
+        u32 acc = val_mul(t, w, x[0]);
+        for (u32 j = 1; j < in_dim; j++)
+            acc = val_add(t, acc, val_mul(t, w + j, x[j]));
+        out[i] = acc;
+    }
+}
+
+static void gpt_rmsnorm(Tape *t, u32 *x, u32 dim) {
+    u32 sumsq = val_mul(t, x[0], x[0]);
+    for (u32 i = 1; i < dim; i++)
+        sumsq = val_add(t, sumsq, val_mul(t, x[i], x[i]));
+    u32 inv_n = tape_leaf(t, 1.0f / (f32)dim);
+    u32 ms = val_mul(t, sumsq, inv_n);
+    u32 eps = tape_leaf(t, 1e-5f);
+    u32 scale = val_pow(t, val_add(t, ms, eps), -0.5f);
+    for (u32 i = 0; i < dim; i++)
+        x[i] = val_mul(t, x[i], scale);
+}
+
+static void gpt_softmax(Tape *t, u32 *logits, u32 n, u32 *out) {
+    f32 max_v = tape_data(t, logits[0]);
+    for (u32 i = 1; i < n; i++) {
+        f32 v = tape_data(t, logits[i]);
+        if (v > max_v) max_v = v;
+    }
+    u32 mx = tape_leaf(t, max_v);
+
+    u32 exps[GPT_VOCAB];
+    u32 total = val_exp(t, val_sub(t, logits[0], mx));
+    exps[0] = total;
+    for (u32 i = 1; i < n; i++) {
+        exps[i] = val_exp(t, val_sub(t, logits[i], mx));
+        total = val_add(t, total, exps[i]);
+    }
+
+    u32 inv_total = val_pow(t, total, -1.0f);
+    for (u32 i = 0; i < n; i++)
+        out[i] = val_mul(t, exps[i], inv_total);
+}
+
+// Cross-entropy: -log(softmax(logits)[target])
+// = log(sum(exp(logits - max))) - (logits[target] - max)
+static u32 gpt_cross_entropy(Tape *t, u32 *logits, u32 target) {
+    f32 max_v = tape_data(t, logits[0]);
+    for (u32 i = 1; i < GPT_VOCAB; i++) {
+        f32 v = tape_data(t, logits[i]);
+        if (v > max_v) max_v = v;
+    }
+    u32 mx = tape_leaf(t, max_v);
+    u32 se = val_exp(t, val_sub(t, logits[0], mx));
+    for (u32 i = 1; i < GPT_VOCAB; i++)
+        se = val_add(t, se, val_exp(t, val_sub(t, logits[i], mx)));
+    return val_sub(t, val_log(t, se), val_sub(t, logits[target], mx));
+}
+
+// Forward one position through GPT, writes logits_out[GPT_VOCAB]
+static void gpt_forward_pos(GPT *g, u32 token_id, u32 pos_id,
+                             u32 key_cache[][GPT_EMBD], u32 val_cache[][GPT_EMBD],
+                             u32 *logits_out) {
+    Tape *t = &g->tape;
+    u32 x[GPT_EMBD];
+
+    // Embedding: x = wte[token_id] + wpe[pos_id]
+    for (u32 d = 0; d < GPT_EMBD; d++)
+        x[d] = val_add(t, g->wte + token_id * GPT_EMBD + d,
+                           g->wpe + pos_id * GPT_EMBD + d);
+
+    // Initial RMSNorm (matches microgpt.py)
+    gpt_rmsnorm(t, x, GPT_EMBD);
+
+    // --- Transformer layer (n_layer=1) ---
+
+    // 1) Multi-head attention
+    u32 x_res[GPT_EMBD];
+    memcpy(x_res, x, sizeof(x));
+    gpt_rmsnorm(t, x, GPT_EMBD);
+
+    u32 q[GPT_EMBD], k[GPT_EMBD], v[GPT_EMBD];
+    gpt_linear(t, g->attn_wq, x, GPT_EMBD, q, GPT_EMBD);
+    gpt_linear(t, g->attn_wk, x, GPT_EMBD, k, GPT_EMBD);
+    gpt_linear(t, g->attn_wv, x, GPT_EMBD, v, GPT_EMBD);
+
+    // Store K, V in cache (tape indices)
+    memcpy(key_cache[pos_id], k, sizeof(k));
+    memcpy(val_cache[pos_id], v, sizeof(v));
+
+    u32 x_attn[GPT_EMBD];
+    u32 num_cached = pos_id + 1;
+    f32 scale_val = 1.0f / sqrtf((f32)GPT_HDIM);
+
+    for (u32 h = 0; h < GPT_HEAD; h++) {
+        u32 hs = h * GPT_HDIM;
+
+        // Attention logits: q·k / sqrt(head_dim)
+        u32 attn_logits[GPT_BLOCK];
+        for (u32 tt = 0; tt < num_cached; tt++) {
+            u32 dot = val_mul(t, q[hs], key_cache[tt][hs]);
+            for (u32 j = 1; j < GPT_HDIM; j++)
+                dot = val_add(t, dot, val_mul(t, q[hs + j], key_cache[tt][hs + j]));
+            u32 scale = tape_leaf(t, scale_val);
+            attn_logits[tt] = val_mul(t, dot, scale);
+        }
+
+        // Softmax over cached positions
+        u32 attn_weights[GPT_BLOCK];
+        gpt_softmax(t, attn_logits, num_cached, attn_weights);
+
+        // Weighted sum of values
+        for (u32 j = 0; j < GPT_HDIM; j++) {
+            u32 acc = val_mul(t, attn_weights[0], val_cache[0][hs + j]);
+            for (u32 tt = 1; tt < num_cached; tt++)
+                acc = val_add(t, acc, val_mul(t, attn_weights[tt], val_cache[tt][hs + j]));
+            x_attn[hs + j] = acc;
+        }
+    }
+
+    // Output projection
+    gpt_linear(t, g->attn_wo, x_attn, GPT_EMBD, x, GPT_EMBD);
+
+    // Residual
+    for (u32 d = 0; d < GPT_EMBD; d++)
+        x[d] = val_add(t, x[d], x_res[d]);
+
+    // 2) MLP
+    memcpy(x_res, x, sizeof(x));
+    gpt_rmsnorm(t, x, GPT_EMBD);
+
+    u32 h1[GPT_MLP_HIDDEN];
+    gpt_linear(t, g->mlp_fc1, x, GPT_EMBD, h1, GPT_MLP_HIDDEN);
+
+    // ReLU²
+    for (u32 i = 0; i < GPT_MLP_HIDDEN; i++) {
+        u32 r = val_relu(t, h1[i]);
+        h1[i] = val_mul(t, r, r);
+    }
+
+    gpt_linear(t, g->mlp_fc2, h1, GPT_MLP_HIDDEN, x, GPT_EMBD);
+
+    // Residual
+    for (u32 d = 0; d < GPT_EMBD; d++)
+        x[d] = val_add(t, x[d], x_res[d]);
+
+    // lm_head
+    gpt_linear(t, g->lm_head, x, GPT_EMBD, logits_out, GPT_VOCAB);
+}
+
+// Adam with GPT hyperparams (beta2=0.95 matching microgpt.py)
+static void gpt_adam_step(Tape *t, f32 lr, AdamState *st) {
+    f32 b1 = 0.9f, b2 = 0.95f, eps = 1e-8f;
+    st->b1_t *= b1;
+    st->b2_t *= b2;
+    f32 bc1 = 1.0f - st->b1_t;
+    f32 bc2 = 1.0f - st->b2_t;
+    for (u32 i = 0; i < t->perm_count; i++) {
+        Node *n = &t->base[i];
+        f32 g = n->grad;
+        n->local_grads[0] = b1 * n->local_grads[0] + (1 - b1) * g;
+        n->local_grads[1] = b2 * n->local_grads[1] + (1 - b2) * g * g;
+        f32 m_hat = n->local_grads[0] / bc1;
+        f32 v_hat = n->local_grads[1] / bc2;
+        n->data -= lr * m_hat / (sqrtf(v_hat) + eps);
+    }
+}
+
+static int gpt_main(void) {
+    mem_arena *arena = arena_create(MiB(64), MiB(1));
+
+    NamesDataset names = names_load(arena);
+    if (!names.names) return 1;
+    names_shuffle(&names);
+    printf("num docs: %u\n", names.count);
+    printf("vocab size: %d\n", GPT_VOCAB);
+
+    GPT g = gpt_create();
+    printf("num params: %u\n", g.tape.perm_count);
+
+    int num_steps = 500;
+    f32 lr_base = 0.01f;
+    AdamState adam = { 1.0f, 1.0f };
+
+    for (int step = 0; step < num_steps; step++) {
+        Tape *t = &g.tape;
+        tape_reset(t);
+        tape_zero_grad(t);
+
+        // Tokenize: [BOS, c0, c1, ..., cn, BOS]
+        const char *doc = names.names[step % names.count];
+        int doc_len = (int)strlen(doc);
+        u32 tokens[256];
+        tokens[0] = GPT_BOS;
+        int tok_len = 1;
+        for (int i = 0; i < doc_len; i++)
+            tokens[tok_len++] = (u32)(doc[i] - 'a');
+        tokens[tok_len++] = GPT_BOS;
+
+        int n = tok_len - 1;
+        if (n > GPT_BLOCK) n = GPT_BLOCK;
+
+        // Forward all positions
+        u32 key_cache[GPT_BLOCK][GPT_EMBD];
+        u32 val_cache[GPT_BLOCK][GPT_EMBD];
+        u32 loss_nodes[GPT_BLOCK];
+
+        for (int pos = 0; pos < n; pos++) {
+            u32 logits[GPT_VOCAB];
+            gpt_forward_pos(&g, tokens[pos], pos, key_cache, val_cache, logits);
+            loss_nodes[pos] = gpt_cross_entropy(t, logits, tokens[pos + 1]);
+        }
+
+        // Average loss
+        u32 total_loss = loss_nodes[0];
+        for (int pos = 1; pos < n; pos++)
+            total_loss = val_add(t, total_loss, loss_nodes[pos]);
+        u32 inv_n = tape_leaf(t, 1.0f / (f32)n);
+        u32 avg_loss = val_mul(t, total_loss, inv_n);
+
+        tape_backward(t, avg_loss);
+
+        f32 lr_t = lr_base * 0.5f * (1.0f + cosf(3.14159265f * (f32)step / (f32)num_steps));
+        gpt_adam_step(t, lr_t, &adam);
+
+        printf("step %4d / %4d | loss %.4f\n", step + 1, num_steps, tape_data(t, avg_loss));
+    }
+
+    // Inference
+    {
+        Tape *t = &g.tape;
+        f32 temperature = 0.5f;
+        const char uchars[] = "abcdefghijklmnopqrstuvwxyz";
+
+        printf("\n--- inference ---\n");
+        for (int sample = 0; sample < 20; sample++) {
+            tape_reset(t);
+
+            u32 key_cache[GPT_BLOCK][GPT_EMBD];
+            u32 val_cache[GPT_BLOCK][GPT_EMBD];
+
+            u32 token = GPT_BOS;
+            char name[GPT_BLOCK + 1];
+            int len = 0;
+
+            for (int pos = 0; pos < GPT_BLOCK; pos++) {
+                u32 logits[GPT_VOCAB];
+                gpt_forward_pos(&g, token, pos, key_cache, val_cache, logits);
+
+                // Temperature scaling + softmax
+                u32 scaled[GPT_VOCAB];
+                f32 inv_temp = 1.0f / temperature;
+                u32 inv_temp_node = tape_leaf(t, inv_temp);
+                for (u32 i = 0; i < GPT_VOCAB; i++)
+                    scaled[i] = val_mul(t, logits[i], inv_temp_node);
+
+                u32 probs[GPT_VOCAB];
+                gpt_softmax(t, scaled, GPT_VOCAB, probs);
+
+                // Weighted random choice
+                f32 r = rng_f32();
+                f32 cumsum = 0;
+                u32 chosen = GPT_BOS;
+                for (u32 i = 0; i < GPT_VOCAB; i++) {
+                    cumsum += tape_data(t, probs[i]);
+                    if (r < cumsum) { chosen = i; break; }
+                }
+
+                if (chosen == GPT_BOS) break;
+                name[len++] = uchars[chosen];
+                token = chosen;
+            }
+            name[len] = '\0';
+            printf("sample %2d: %s\n", sample + 1, name);
+        }
+    }
+
+    tape_destroy(&g.tape);
+    arena_destroy(arena);
+    return 0;
+}
+
 // --- app state ---
 
 typedef enum {
@@ -769,7 +1173,8 @@ typedef enum {
 #define GRID_COUNT (GRID_COLS * GRID_ROWS)
 
 int main(int argc, char *argv[]) {
-    (void)argc; (void)argv;
+    if (argc > 1 && strcmp(argv[1], "gpt") == 0)
+        return gpt_main();
 
     // --- autograd sanity test ---
     {
