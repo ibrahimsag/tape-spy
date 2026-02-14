@@ -267,26 +267,79 @@ static int mlp_predict(MLP *m) {
     return pred;
 }
 
-// --- tape visualization ---
+// --- tape visualization (OKLCH hue-mapped) ---
+
+static float _srgb_gamma(float c) {
+    if (c <= 0.0f) return 0.0f;
+    if (c >= 1.0f) return 1.0f;
+    return c <= 0.0031308f ? c * 12.92f : 1.055f * powf(c, 1.0f/2.4f) - 0.055f;
+}
+
+static void _oklch_to_rgb(float L, float C, float h_deg, u8 *ro, u8 *go, u8 *bo) {
+    float h = h_deg * (3.14159265f / 180.0f);
+    float a = C * cosf(h), b = C * sinf(h);
+
+    // OKLab -> LMS (cube root space)
+    float l_ = L + 0.3963377774f * a + 0.2158037573f * b;
+    float m_ = L - 0.1055613458f * a - 0.0638541728f * b;
+    float s_ = L - 0.0894841775f * a - 1.2914855480f * b;
+    l_ = l_ * l_ * l_;
+    m_ = m_ * m_ * m_;
+    s_ = s_ * s_ * s_;
+
+    // LMS -> linear RGB
+    float rf = +4.0767416621f * l_ - 3.3077115913f * m_ + 0.2309699292f * s_;
+    float gf = -1.2684380046f * l_ + 2.6097574011f * m_ - 0.3413193965f * s_;
+    float bf = -0.0041960863f * l_ - 0.7034186147f * m_ + 1.7076147010f * s_;
+
+    *ro = (u8)(_srgb_gamma(rf) * 255.0f + 0.5f);
+    *go = (u8)(_srgb_gamma(gf) * 255.0f + 0.5f);
+    *bo = (u8)(_srgb_gamma(bf) * 255.0f + 0.5f);
+}
 
 static void dump_tape_spy(Tape *t, const char *path, int S) {
-    u8 *img = calloc(S * S, 1);
+    u16 *counts = calloc(S * S, sizeof(u16));
+    u16 max_count = 0;
     for (u32 i = 0; i < t->count; i++) {
         Node *n = &t->base[i];
         int x = (int)((u64)i * (S - 1) / t->count);
         for (u32 c = 0; c < n->arity; c++) {
             int y = (int)((u64)n->children[c] * (S - 1) / t->count);
             int idx = y * S + x;
-            if (img[idx] < 240) img[idx] += 15;
-            else img[idx] = 255;
+            counts[idx]++;
+            if (counts[idx] > max_count) max_count = counts[idx];
         }
     }
+
+    u8 *rgb = malloc(S * S * 3);
+    for (int i = 0; i < S * S; i++) {
+        if (counts[i] == 0) {
+            rgb[i*3] = rgb[i*3+1] = rgb[i*3+2] = 0;
+        } else {
+            float frac = max_count > 1
+                ? (float)(counts[i] - 1) / (float)(max_count - 1)
+                : 0.0f;
+            // hue: 260 (blue) -> 30 (orange) as density increases
+            float hue = 260.0f - frac * 230.0f;
+            _oklch_to_rgb(0.75f, 0.15f, hue, &rgb[i*3], &rgb[i*3+1], &rgb[i*3+2]);
+        }
+    }
+
+    // mark the diagonal (y=x reference line)
+    for (int i = 0; i < S; i++) {
+        int idx = i * S + i;
+        if (counts[idx] == 0) {
+            rgb[idx*3] = 40; rgb[idx*3+1] = 40; rgb[idx*3+2] = 40;
+        }
+    }
+
     FILE *f = fopen(path, "wb");
-    fprintf(f, "P5\n%d %d\n255\n", S, S);
-    fwrite(img, 1, S * S, f);
+    fprintf(f, "P6\n%d %d\n255\n", S, S);
+    fwrite(rgb, 1, S * S * 3, f);
     fclose(f);
-    free(img);
-    printf("spy plot: %s (%ux%u, %u nodes)\n", path, S, S, t->count);
+    free(counts);
+    free(rgb);
+    printf("spy plot: %s (%ux%u, %u nodes, max density %u)\n", path, S, S, t->count, max_count);
 }
 
 // --- training thread ---
@@ -335,7 +388,7 @@ static void *train_thread_fn(void *arg) {
             tape_backward(tape, loss_idx);
 
             if (atomic_load(&ctx->dump_requested)) {
-                dump_tape_spy(tape, "tape_spy.pgm", 4096);
+                dump_tape_spy(tape, "tape_spy.ppm", 4096);
                 atomic_store(&ctx->dump_requested, false);
             }
 
