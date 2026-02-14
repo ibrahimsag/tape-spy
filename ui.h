@@ -75,6 +75,35 @@ void  ui_line(UICtx *ctx, float x1, float y1, float x2, float y2, UIColor color)
 /* heatmap cell — rect with brightness mapped from value 0..1 */
 void  ui_heat(UICtx *ctx, float x, float y, float w, float h, float value);
 
+/* ---- layout cursor ---- */
+
+typedef struct {
+    float x, y;       /* current cursor position */
+    float w;           /* available width */
+    float spacing;     /* default gap between rows */
+} UILayout;
+
+/* start a vertical layout at (x,y) with width w and row spacing */
+static inline UILayout ui_layout(float x, float y, float w, float spacing) {
+    return (UILayout){ x, y, w, spacing };
+}
+
+/* advance cursor by h + spacing */
+static inline void ui_advance(UILayout *lay, float h) {
+    lay->y += h + lay->spacing;
+}
+
+/* extra vertical gap (beyond default spacing) */
+static inline void ui_spacer(UILayout *lay, float extra) {
+    lay->y += extra;
+}
+
+/* text at cursor, advance by font_size */
+void  ui_label(UICtx *ctx, UILayout *lay, const char *text, UIColor color);
+
+/* full-width button at cursor, advance by h */
+bool  ui_lay_button(UICtx *ctx, UILayout *lay, const char *label, float h);
+
 #endif /* UI_H */
 
 /* ================================================================ */
@@ -261,6 +290,19 @@ void ui_heat(UICtx *ctx, float x, float y, float w, float h, float value) {
     if (value > 1) value = 1;
     uint8_t v = (uint8_t)(value * 255.0f);
     ui_rect(ctx, x, y, w, h, UI_RGB(v, v, v));
+}
+
+/* ---- layout widgets ---- */
+
+void ui_label(UICtx *ctx, UILayout *lay, const char *text, UIColor color) {
+    ui_text(ctx, text, lay->x, lay->y, color);
+    ui_advance(lay, ctx->font_size);
+}
+
+bool ui_lay_button(UICtx *ctx, UILayout *lay, const char *label, float h) {
+    bool clicked = ui_button(ctx, label, lay->x, lay->y, lay->w, h);
+    ui_advance(lay, h);
+    return clicked;
 }
 
 #endif /* UI_IMPLEMENTATION */

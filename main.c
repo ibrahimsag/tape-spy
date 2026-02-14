@@ -496,8 +496,8 @@ int main(int argc, char *argv[]) {
     int panel_w = 280;
     int grid_pixel_w = img_w * GRID_COLS;
     int grid_pixel_h = img_h * GRID_ROWS;
-    int win_w = grid_pixel_w + panel_w;
-    int win_h = grid_pixel_h > 400 ? grid_pixel_h : 400;
+    int win_w = 1024 + panel_w;
+    int win_h = 1024;
 
     SDL_Window *window = SDL_CreateWindow("MNIST", win_w, win_h, SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
@@ -586,33 +586,32 @@ int main(int argc, char *argv[]) {
         SDL_RenderTexture(renderer, grid_tex, NULL, &grid_dst);
 
         // right panel
-        float px = grid_pixel_w + 16;
-        float py = 16;
+        UILayout lay = ui_layout(win_w - panel_w + 16, 16, panel_w - 32, 6);
 
-        ui_text(&ui, "MNIST Explorer", px, py, UI_WHITE);
-        py += 28;
+        ui_label(&ui, &lay, "MNIST Explorer", UI_WHITE);
 
         char buf[64];
         snprintf(buf, sizeof(buf), "showing %u-%u / %u",
                  offset, offset + GRID_COUNT - 1, train_images.count);
-        ui_text(&ui, buf, px, py, UI_GRAY(160));
-        py += 36;
+        ui_label(&ui, &lay, buf, UI_GRAY(160));
+        ui_spacer(&lay, 8);
 
         if (screen == SCREEN_VIEW) {
-            if (ui_button(&ui, "< prev", px, py, 120, 32)) {
+            if (ui_button(&ui, "< prev", lay.x, lay.y, 120, 32)) {
                 if (offset >= GRID_COUNT) offset -= GRID_COUNT;
                 else offset = 0;
                 grid_dirty = true;
             }
-            if (ui_button(&ui, "next >", px + 132, py, 120, 32)) {
+            if (ui_button(&ui, "next >", lay.x + 132, lay.y, 120, 32)) {
                 if (offset + GRID_COUNT < train_images.count) {
                     offset += GRID_COUNT;
                     grid_dirty = true;
                 }
             }
-            py += 48;
+            ui_advance(&lay, 32);
+            ui_spacer(&lay, 8);
 
-            if (ui_button(&ui, "Train", px, py, 252, 36)) {
+            if (ui_lay_button(&ui, &lay, "Train", 36)) {
                 screen = SCREEN_TRAINING;
                 train_ctx = (TrainCtx){0};
                 train_ctx.mlp = &mlp;
@@ -624,11 +623,10 @@ int main(int argc, char *argv[]) {
                 pthread_create(&train_thread, NULL, train_thread_fn, &train_ctx);
                 train_thread_active = true;
             }
-            py += 52;
+            ui_spacer(&lay, 8);
 
-            ui_text(&ui, "arrows/space: browse", px, py, UI_GRAY(100));
-            py += 20;
-            ui_text(&ui, "q/esc: quit", px, py, UI_GRAY(100));
+            ui_label(&ui, &lay, "arrows/space: browse", UI_GRAY(100));
+            ui_label(&ui, &lay, "q/esc: quit", UI_GRAY(100));
 
         } else if (screen == SCREEN_TRAINING) {
             int s = atomic_load(&train_ctx.step);
@@ -638,25 +636,22 @@ int main(int argc, char *argv[]) {
             float acc = s > 0 ? 100.0f * cor / s : 0;
 
             snprintf(buf, sizeof(buf), "epoch %d  step %d", ep, s);
-            ui_text(&ui, buf, px, py, UI_RGB(100, 200, 100));
-            py += 22;
+            ui_label(&ui, &lay, buf, UI_RGB(100, 200, 100));
 
             snprintf(buf, sizeof(buf), "loss: %.4f", loss);
-            ui_text(&ui, buf, px, py, UI_GRAY(160));
-            py += 22;
+            ui_label(&ui, &lay, buf, UI_GRAY(160));
 
             snprintf(buf, sizeof(buf), "train acc: %.1f%%", acc);
-            ui_text(&ui, buf, px, py, UI_GRAY(160));
-            py += 22;
+            ui_label(&ui, &lay, buf, UI_GRAY(160));
 
             float ta = atomic_load(&train_ctx.test_acc);
             snprintf(buf, sizeof(buf), "test acc:  %.1f%%", ta);
-            ui_text(&ui, buf, px, py, ta > 0 ? UI_WHITE : UI_GRAY(100));
-            py += 28;
+            ui_label(&ui, &lay, buf, ta > 0 ? UI_WHITE : UI_GRAY(100));
+            ui_spacer(&lay, 6);
 
             // test accuracy graph
             {
-                float gx = px, gy = py, gw = 240, gh = 80;
+                float gx = lay.x, gy = lay.y, gw = lay.w, gh = 80;
                 ui_rect(&ui, gx, gy, gw, gh, UI_GRAY(35));
                 ui_rect_outline(&ui, gx, gy, gw, gh, UI_GRAY(60));
 
@@ -665,7 +660,6 @@ int main(int argc, char *argv[]) {
                 int start = hc < ACC_HIST ? 0 : hc - ACC_HIST;
 
                 if (show > 0) {
-                    // find y range
                     float ymin = 100, ymax = 0;
                     for (int i = 0; i < show; i++) {
                         float v = train_ctx.hist[(start + i) % ACC_HIST];
@@ -680,20 +674,16 @@ int main(int argc, char *argv[]) {
                     float yrange = ymax - ymin;
                     if (yrange < 1) yrange = 1;
 
-                    // y-axis labels
                     snprintf(buf, sizeof(buf), "%.0f%%", ymax);
                     ui_text(&ui, buf, gx + 2, gy, UI_GRAY(100));
                     snprintf(buf, sizeof(buf), "%.0f%%", ymin);
                     ui_text(&ui, buf, gx + 2, gy + gh - 16, UI_GRAY(100));
 
-                    // line graph
                     for (int i = 0; i < show; i++) {
                         float v = train_ctx.hist[(start + i) % ACC_HIST];
                         float x0 = gx + (show > 1 ? (float)i / (show - 1) * gw : gw * 0.5f);
                         float y0 = gy + gh - (v - ymin) / yrange * gh;
-                        // dot
                         ui_rect(&ui, x0 - 1, y0 - 1, 3, 3, UI_RGB(80, 180, 255));
-                        // line to previous
                         if (i > 0) {
                             float vp = train_ctx.hist[(start + i - 1) % ACC_HIST];
                             float xp = gx + (float)(i - 1) / (show - 1) * gw;
@@ -702,10 +692,10 @@ int main(int argc, char *argv[]) {
                         }
                     }
                 }
-                py += gh + 8;
+                ui_advance(&lay, gh);
             }
 
-            if (ui_button(&ui, "Stop", px, py, 252, 32)) {
+            if (ui_lay_button(&ui, &lay, "Stop", 32)) {
                 atomic_store(&train_ctx.stop, true);
                 pthread_join(train_thread, NULL);
                 train_thread_active = false;
